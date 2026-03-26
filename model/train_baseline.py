@@ -94,15 +94,10 @@ def get_transforms(train=True, size=96):
     ])
 
 
-def binary_target(target):
-    """Oxford-IIIT Pets: classes 0-11 are cat breeds, 12-36 are dog breeds."""
-    return 0 if target < 12 else 1
-
-
 class BinaryPetsDataset(torch.utils.data.Dataset):
     def __init__(self, root, split, transform):
         self.dataset = datasets.OxfordIIITPet(
-            root=root, split=split, target_types="category",
+            root=root, split=split, target_types="binary-category",
             download=True, transform=transform,
         )
 
@@ -111,7 +106,7 @@ class BinaryPetsDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         img, label = self.dataset[idx]
-        return img, binary_target(label)
+        return img, label  # 0=cat, 1=dog
 
 
 def get_loaders(data_dir, batch_size=64, size=96, num_workers=4):
@@ -167,13 +162,19 @@ def train(args):
     )
     print(f"Train: {len(train_loader.dataset)}, Val: {len(val_loader.dataset)}")
 
+    # Count class distribution for weighted loss
+    cat_count = sum(1 for _, l in train_loader.dataset if l == 0)
+    dog_count = len(train_loader.dataset) - cat_count
+    print(f"Class balance: {cat_count} cats, {dog_count} dogs")
+    weight = torch.tensor([dog_count / cat_count, 1.0]).to(device)
+
     model = MobileNetV1(alpha=args.alpha, num_classes=2).to(device)
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model params: {param_count:,}")
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=weight)
 
     best_acc = 0.0
     save_dir = Path(args.save_dir)
@@ -204,14 +205,17 @@ def train(args):
 # ---------------------------------------------------------------------------
 
 def export_onnx(model, save_dir, size=96):
-    model.train(False)
-    model_cpu = model.cpu()
-    dummy = torch.randn(1, 3, size, size)
-    path = Path(save_dir) / "model_baseline.onnx"
-    torch.onnx.export(model_cpu, dummy, str(path),
-                      input_names=["input"], output_names=["output"],
-                      opset_version=13)
-    print(f"Exported ONNX to {path}")
+    try:
+        model.train(False)
+        model_cpu = model.cpu()
+        dummy = torch.randn(1, 3, size, size)
+        path = Path(save_dir) / "model_baseline.onnx"
+        torch.onnx.export(model_cpu, dummy, str(path),
+                          input_names=["input"], output_names=["output"],
+                          opset_version=13)
+        print(f"Exported ONNX to {path}")
+    except Exception as e:
+        print(f"ONNX export skipped: {e}")
 
 
 def export_test_images(data_dir, save_path, size=96, n_per_class=10):
