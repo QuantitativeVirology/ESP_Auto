@@ -93,10 +93,19 @@ def unpack_ternary_weights(packed, num_weights, scale_pos, scale_neg):
     return result
 
 
-def nchw_to_nhwc(weight):
-    """Transpose conv weight from [C_out, C_in, K, K] to [C_out, K, K, C_in]."""
+def nchw_to_nhwc(weight, depthwise=False):
+    """Transpose conv weight to firmware layout.
+
+    Standard conv: [C_out, C_in, K, K] → [C_out, K, K, C_in]
+    Depthwise conv: [C, 1, K, K] → [C, K, K] (squeeze the groups=1 dim)
+    Linear: [N_out, N_in] → unchanged
+    """
     if weight.ndim == 4:
-        return weight.permute(0, 2, 3, 1).contiguous()
+        w = weight.permute(0, 2, 3, 1).contiguous()
+        if depthwise:
+            # [C, K, K, 1] → [C, K, K]
+            w = w.squeeze(-1)
+        return w
     return weight  # Linear weights [N_out, N_in] stay as-is
 
 
@@ -155,7 +164,7 @@ def extract_layers(model, threshold_ratio=0.05):
             layer_type = "LAYER_DEPTHWISE_CONV2D" if is_depthwise else "LAYER_CONV2D"
 
             if isinstance(conv, TernaryQuantWrapper):
-                w = nchw_to_nhwc(conv.weight_fp.data)
+                w = nchw_to_nhwc(conv.weight_fp.data, depthwise=is_depthwise)
                 packed, sp, sn, sparsity = pack_ternary_weights(w, threshold_ratio)
 
                 bn_s = bn.weight.data / torch.sqrt(bn.running_var + 1e-5)
@@ -180,7 +189,7 @@ def extract_layers(model, threshold_ratio=0.05):
                     "sparsity": sparsity,
                 })
             else:
-                w_nhwc = nchw_to_nhwc(conv.weight.data)
+                w_nhwc = nchw_to_nhwc(conv.weight.data, depthwise=is_depthwise)
                 w_int8, w_scale = pack_int8_weights(w_nhwc)
 
                 bn_s = bn.weight.data / torch.sqrt(bn.running_var + 1e-5)
