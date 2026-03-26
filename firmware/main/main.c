@@ -176,6 +176,7 @@ void app_main(void)
     ESP_LOGI(TAG, "ESP32-S3 Ternary Vision Inference");
 
     gpio_init_pins();
+    inference_init();
     inference_print_memory_map();
 
     esp_err_t cam_err = camera_init();

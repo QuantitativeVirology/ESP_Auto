@@ -12,14 +12,20 @@ static const char *TAG = "inference";
  * Ping-pong activation buffers in SRAM (16-byte aligned).
  * Max activation: 48*48*16 = 36864 bytes (features.0.pw output).
  * Input (96*96*3 = 27648) also fits.
+ *
+ * INT32 accumulator reuses buf_b's memory (cast to int32_t*) since
+ * we write INT32 accumulators then requantize back to INT8 into buf_b
+ * before the next layer reads it.
  */
 #define MAX_ACTIVATION_SIZE (48 * 48 * 16)
 static int8_t __attribute__((aligned(16))) buf_a[MAX_ACTIVATION_SIZE];
 static int8_t __attribute__((aligned(16))) buf_b[MAX_ACTIVATION_SIZE];
 
-/* INT32 accumulator buffer — shared, sized for largest layer output */
-#define MAX_ACC_SIZE (48 * 48 * 16)
-static int32_t __attribute__((aligned(16))) acc_buf[MAX_ACC_SIZE];
+/*
+ * Accumulator buffer — must hold largest single-layer output as INT32.
+ * Heap-allocated at init to avoid static DRAM pressure.
+ */
+static int32_t *acc_buf = NULL;
 
 /*
  * Compute output spatial dimensions for a conv/depthwise layer.
@@ -27,6 +33,17 @@ static int32_t __attribute__((aligned(16))) acc_buf[MAX_ACC_SIZE];
 static inline int out_dim(int in_dim, int kernel, int stride, int padding)
 {
     return (in_dim + 2 * padding - kernel) / stride + 1;
+}
+
+void inference_init(void)
+{
+    if (acc_buf) return;
+    acc_buf = heap_caps_malloc(MAX_ACTIVATION_SIZE * sizeof(int32_t),
+                               MALLOC_CAP_INTERNAL);
+    if (!acc_buf) {
+        ESP_LOGE(TAG, "Failed to allocate accumulator buffer (%d bytes)",
+                 (int)(MAX_ACTIVATION_SIZE * sizeof(int32_t)));
+    }
 }
 
 int classify_image(const int8_t *input_96x96x3)
