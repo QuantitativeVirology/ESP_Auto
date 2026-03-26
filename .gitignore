@@ -1,0 +1,43 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# PyTorch
+*.pt
+*.pth
+*.onnx
+checkpoints/
+model/.cache/
+
+# Datasets
+model/datasets/data/
+model/datasets/*.zip
+model/datasets/*.tar.gz
+
+# ESP-IDF
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+firmware/dependencies.lock
+
+# Generated
+firmware/main/model_data.h
+firmware/main/test_images.h
+results.tsv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
