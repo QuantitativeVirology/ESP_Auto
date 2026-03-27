@@ -78,19 +78,26 @@ class MobileNetV1(nn.Module):
 # Dataset
 # ---------------------------------------------------------------------------
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
 def get_transforms(train=True, size=96):
     if train:
         return transforms.Compose([
             transforms.Resize(112),
             transforms.RandomCrop(size),
             transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+            transforms.RandomAffine(degrees=15, translate=(0.1, 0.1)),
             transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
     return transforms.Compose([
-        transforms.Resize(size),
+        transforms.Resize(size + 8),
         transforms.CenterCrop(size),
         transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
 
 
@@ -219,8 +226,14 @@ def export_onnx(model, save_dir, size=96):
 
 
 def export_test_images(data_dir, save_path, size=96, n_per_class=10):
-    """Export test images as C header for firmware-side validation."""
-    val_ds = BinaryPetsDataset(data_dir, "test", get_transforms(False, size))
+    """Export test images as raw uint8 C header for firmware-side validation."""
+    # Use unnormalized transforms for raw pixel export
+    raw_transform = transforms.Compose([
+        transforms.Resize(size + 8),
+        transforms.CenterCrop(size),
+        transforms.ToTensor(),
+    ])
+    val_ds = BinaryPetsDataset(data_dir, "test", raw_transform)
 
     cats, dogs = [], []
     for img, label in val_ds:
