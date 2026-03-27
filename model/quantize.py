@@ -59,13 +59,19 @@ class TernaryQuantWrapper(nn.Module):
 
     def __init__(self, module, threshold_ratio=0.05):
         super().__init__()
-        self.module = module
         self.threshold_ratio = threshold_ratio
+
+        # Store module config for functional dispatch
+        self._is_conv = isinstance(module, nn.Conv2d)
+        if self._is_conv:
+            self._stride = module.stride
+            self._padding = module.padding
+            self._dilation = module.dilation
+            self._groups = module.groups
+        self._bias = module.bias  # may be None
 
         # Full-precision shadow weights (gradient target)
         w = module.weight.data.clone()
-        del module._parameters["weight"]
-
         self.weight_fp = nn.Parameter(w)
 
         # Per-layer learned scales (initialized from weight statistics)
@@ -78,13 +84,16 @@ class TernaryQuantWrapper(nn.Module):
             torch.tensor(neg_vals.mean().item() if len(neg_vals) > 0 else 0.1)
         )
 
+        # Keep reference for export (geometry info)
+        self.module = module
+
         self.enabled = False
         self.frozen = False
         self._frozen_ternary = None
 
     def forward(self, x):
         if self.frozen and self._frozen_ternary is not None:
-            w = self._frozen_ternary * self.scale_pos  # simplified: use frozen masks with live scales
+            w = self._frozen_ternary * self.scale_pos
         elif self.enabled:
             w = TernarizeFunction.apply(
                 self.weight_fp, self.scale_pos, self.scale_neg,
@@ -93,8 +102,11 @@ class TernaryQuantWrapper(nn.Module):
         else:
             w = self.weight_fp
 
-        self.module.weight = w
-        return self.module(x)
+        if self._is_conv:
+            return F.conv2d(x, w, self._bias,
+                            self._stride, self._padding,
+                            self._dilation, self._groups)
+        return F.linear(x, w, self._bias)
 
     def freeze_ternary(self):
         """Freeze the ternary mask but keep scales trainable."""
