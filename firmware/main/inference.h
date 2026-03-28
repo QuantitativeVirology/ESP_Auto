@@ -30,5 +30,6 @@ typedef struct {
 #define CLASS_DOG 1
 
 void inference_init(void);
+void inference_deinit(void);
 int classify_image(const int8_t *input_96x96x3);
 void inference_print_memory_map(void);
