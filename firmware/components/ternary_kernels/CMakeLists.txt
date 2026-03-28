@@ -4,5 +4,6 @@ idf_component_register(
          "src/ternary_conv2d_simd.c"
          "src/ternary_dense_simd.c"
          "src/int8_kernels.c"
+         "test/test_kernels.c"
     INCLUDE_DIRS "include"
 )

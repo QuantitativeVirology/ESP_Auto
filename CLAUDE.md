@@ -81,7 +81,8 @@ SIMD assembly stubs currently fall through to C reference implementations. The i
 
 ## GPIO Pins
 
-- PIN_DOG = GPIO 7, PIN_CAT = GPIO 8, PIN_FRAME = GPIO 9 (timing)
+- PIN_DOG = GPIO 45, PIN_CAT = GPIO 46, PIN_FRAME = GPIO 47 (timing)
+- Camera uses GPIOs 4-18, 43, 44 — do not conflict
 
 ## Firmware Modes
 

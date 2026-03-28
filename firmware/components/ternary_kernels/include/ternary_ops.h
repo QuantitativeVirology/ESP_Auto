@@ -101,3 +101,6 @@ void requantize_i32_to_i8(
 
 /** ReLU in-place on INT8 activations. */
 void relu_i8(int8_t *data, int count);
+
+/** Run kernel correctness tests (SIMD vs C reference). Returns number of failures. */
+int run_kernel_tests(void);

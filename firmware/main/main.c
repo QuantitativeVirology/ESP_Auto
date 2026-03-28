@@ -8,12 +8,14 @@
 
 #include "camera.h"
 #include "inference.h"
+#include "ternary_ops.h"
 
 static const char *TAG = "main";
 
-#define PIN_DOG   GPIO_NUM_7
-#define PIN_CAT   GPIO_NUM_8
-#define PIN_FRAME GPIO_NUM_9
+// Signal pins — avoid camera GPIOs (4-18, 43, 44)
+#define PIN_DOG   GPIO_NUM_45
+#define PIN_CAT   GPIO_NUM_46
+#define PIN_FRAME GPIO_NUM_47
 
 static void gpio_init_pins(void)
 {
@@ -154,8 +156,7 @@ static void uart_cmd_task(void *arg)
             }
 #endif
             if (strcmp(line, "RUN_TESTS") == 0) {
-                // TODO: run kernel correctness tests
-                printf("TESTS NOT IMPLEMENTED\n");
+                run_kernel_tests();
                 continue;
             }
             if (strcmp(line, "MEMORY") == 0) {
