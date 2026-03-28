@@ -67,7 +67,7 @@ int classify_image(const int8_t *input_96x96x3)
             int out_count = h_out * w_out * L->out_c;
 
             if (L->quant == QUANT_TERNARY) {
-                ternary_conv2d_ref(
+                ternary_conv2d_simd(
                     in, (const uint8_t *)L->weights, acc_buf,
                     L->scale_pos, L->scale_neg,
                     cur_h, cur_w, L->in_c,
@@ -97,7 +97,7 @@ int classify_image(const int8_t *input_96x96x3)
 
             if (L->quant == QUANT_TERNARY) {
                 /* Depthwise ternary: use conv2d_ref with C_out == C_in, groups=C */
-                ternary_conv2d_ref(
+                ternary_conv2d_simd(
                     in, (const uint8_t *)L->weights, acc_buf,
                     L->scale_pos, L->scale_neg,
                     cur_h, cur_w, L->in_c,
@@ -124,7 +124,7 @@ int classify_image(const int8_t *input_96x96x3)
             int n_out = L->out_c;
 
             if (L->quant == QUANT_TERNARY) {
-                ternary_dense_ref(
+                ternary_dense_simd(
                     in, (const uint8_t *)L->weights, acc_buf,
                     L->scale_pos, L->scale_neg,
                     n_in, n_out);
