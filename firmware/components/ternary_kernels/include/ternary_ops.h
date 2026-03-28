@@ -19,7 +19,8 @@ void ternary_conv2d_ref(
     float scale_neg,
     int H, int W, int C_in,
     int C_out, int K,
-    int stride, int padding);
+    int stride, int padding,
+    int y_out_start, int y_out_count);
 
 /** Ternary Conv2d — SIMD-optimized (same interface as ref). */
 void ternary_conv2d_simd(
@@ -30,7 +31,8 @@ void ternary_conv2d_simd(
     float scale_neg,
     int H, int W, int C_in,
     int C_out, int K,
-    int stride, int padding);
+    int stride, int padding,
+    int y_out_start, int y_out_count);
 
 /**
  * Ternary Dense (fully-connected) — C reference implementation.
@@ -64,7 +66,8 @@ void int8_conv2d(
     int32_t *output,
     int H, int W, int C_in,
     int C_out, int K,
-    int stride, int padding);
+    int stride, int padding,
+    int y_out_start, int y_out_count);
 
 void int8_depthwise_conv2d(
     const int8_t *input,
@@ -72,7 +75,8 @@ void int8_depthwise_conv2d(
     const int32_t *bias,
     int32_t *output,
     int H, int W, int C,
-    int K, int stride, int padding);
+    int K, int stride, int padding,
+    int y_out_start, int y_out_count);
 
 /** INT8 Dense (fully-connected). Weights: [N_out, N_in] int8_t. */
 void int8_dense(

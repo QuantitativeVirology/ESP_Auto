@@ -89,9 +89,9 @@ void ternary_conv2d_simd(
     float scale_neg,
     int H, int W, int C_in,
     int C_out, int K,
-    int stride, int padding)
+    int stride, int padding,
+    int y_out_start, int y_out_count)
 {
-    int H_out = (H + 2 * padding - K) / stride + 1;
     int W_out = (W + 2 * padding - K) / stride + 1;
     int C_in_padded = (C_in + 63) & ~63;
     int row_packed_bytes = (C_in_padded / 64) * 16;
@@ -99,10 +99,10 @@ void ternary_conv2d_simd(
     /* Temporary aligned buffer for one row of input (with padding handling) */
     static int8_t __attribute__((aligned(16))) input_row[MAX_EXPANDED_ROW];
 
-    memset(output, 0, H_out * W_out * C_out * sizeof(int32_t));
+    memset(output, 0, y_out_count * W_out * C_out * sizeof(int32_t));
 
     for (int oc = 0; oc < C_out; oc++) {
-        for (int oh = 0; oh < H_out; oh++) {
+        for (int oh = y_out_start; oh < y_out_start + y_out_count; oh++) {
             for (int ow = 0; ow < W_out; ow++) {
                 int32_t acc = 0;
 
@@ -130,7 +130,7 @@ void ternary_conv2d_simd(
                     }
                 }
 
-                output[oh * W_out * C_out + ow * C_out + oc] = acc;
+                output[(oh - y_out_start) * W_out * C_out + ow * C_out + oc] = acc;
             }
         }
     }

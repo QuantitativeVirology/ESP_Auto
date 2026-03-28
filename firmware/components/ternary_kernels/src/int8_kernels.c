@@ -14,13 +14,13 @@ void int8_conv2d(
     int32_t *output,
     int H, int W, int C_in,
     int C_out, int K,
-    int stride, int padding)
+    int stride, int padding,
+    int y_out_start, int y_out_count)
 {
-    int H_out = (H + 2 * padding - K) / stride + 1;
     int W_out = (W + 2 * padding - K) / stride + 1;
 
     for (int oc = 0; oc < C_out; oc++) {
-        for (int oh = 0; oh < H_out; oh++) {
+        for (int oh = y_out_start; oh < y_out_start + y_out_count; oh++) {
             for (int ow = 0; ow < W_out; ow++) {
                 int32_t acc = bias ? bias[oc] : 0;
 
@@ -40,7 +40,7 @@ void int8_conv2d(
                     }
                 }
 
-                output[oh * W_out * C_out + ow * C_out + oc] = acc;
+                output[(oh - y_out_start) * W_out * C_out + ow * C_out + oc] = acc;
             }
         }
     }
@@ -52,13 +52,13 @@ void int8_depthwise_conv2d(
     const int32_t *bias,
     int32_t *output,
     int H, int W, int C,
-    int K, int stride, int padding)
+    int K, int stride, int padding,
+    int y_out_start, int y_out_count)
 {
-    int H_out = (H + 2 * padding - K) / stride + 1;
     int W_out = (W + 2 * padding - K) / stride + 1;
 
     for (int c = 0; c < C; c++) {
-        for (int oh = 0; oh < H_out; oh++) {
+        for (int oh = y_out_start; oh < y_out_start + y_out_count; oh++) {
             for (int ow = 0; ow < W_out; ow++) {
                 int32_t acc = bias ? bias[c] : 0;
 
@@ -77,7 +77,7 @@ void int8_depthwise_conv2d(
                     }
                 }
 
-                output[oh * W_out * C + ow * C + c] = acc;
+                output[(oh - y_out_start) * W_out * C + ow * C + c] = acc;
             }
         }
     }

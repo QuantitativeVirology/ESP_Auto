@@ -72,13 +72,15 @@ int classify_image(const int8_t *input_96x96x3)
                     L->scale_pos, L->scale_neg,
                     cur_h, cur_w, L->in_c,
                     L->out_c, L->kernel,
-                    L->stride, L->padding);
+                    L->stride, L->padding,
+                    0, h_out);
             } else {
                 int8_conv2d(
                     in, (const int8_t *)L->weights, L->bias, acc_buf,
                     cur_h, cur_w, L->in_c,
                     L->out_c, L->kernel,
-                    L->stride, L->padding);
+                    L->stride, L->padding,
+                    0, h_out);
             }
 
             requantize_i32_to_i8(acc_buf, out, out_count,
@@ -102,12 +104,14 @@ int classify_image(const int8_t *input_96x96x3)
                     L->scale_pos, L->scale_neg,
                     cur_h, cur_w, L->in_c,
                     L->out_c, L->kernel,
-                    L->stride, L->padding);
+                    L->stride, L->padding,
+                    0, h_out);
             } else {
                 int8_depthwise_conv2d(
                     in, (const int8_t *)L->weights, L->bias, acc_buf,
                     cur_h, cur_w, L->in_c,
-                    L->kernel, L->stride, L->padding);
+                    L->kernel, L->stride, L->padding,
+                    0, h_out);
             }
 
             requantize_i32_to_i8(acc_buf, out, out_count,
