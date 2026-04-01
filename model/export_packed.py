@@ -450,116 +450,6 @@ def _sequential_calibration(layers, data_dir=None):
 
     print(f"  Verification: classifier output = {act.flatten()[:2]} -> {'CAT' if act.flatten()[0] > act.flatten()[1] else 'DOG'}")
 
-    # --- Bias calibration pass ---
-    # Run all calibration images through the quantized chain with current requant,
-    # collect classifier INT32 accumulators (before requant), and compare with
-    # float model predictions to compute a correction offset.
-    print("[export] Calibrating classifier bias...")
-    cls_layer = [L for L in layers if L['name'] == 'classifier'][0]
-    cls_acc_per_image = []  # [N_images, 2] INT32 accumulators
-
-    for img_idx, int8_input in enumerate(cal_images):
-        act_cal = int8_input.copy()
-        cur_h_cal, cur_w_cal = 96, 96
-
-        for li_cal, L_cal in enumerate(layers):
-            if L_cal['type'] == 'LAYER_GLOBAL_AVG_POOL':
-                pooled = act_cal.astype(np.int32).mean(axis=(0, 1))
-                act_cal = np.clip(np.round(pooled), -128, 127).astype(np.int8).reshape(1, 1, -1)
-                cur_h_cal, cur_w_cal = 1, 1
-                continue
-
-            K = L_cal.get('kernel', 1) or 1
-            S = L_cal.get('stride', 1) or 1
-            P = L_cal.get('padding', 0)
-            is_dw = L_cal['type'] == 'LAYER_DEPTHWISE_CONV2D'
-            is_dense = L_cal['type'] == 'LAYER_DENSE'
-
-            if is_dense:
-                in_flat = act_cal.flatten().astype(np.int32)
-                w = L_cal['weights_int8'].reshape(L_cal['out_c'], L_cal['in_c'])
-                acc_cal = np.zeros((1, L_cal['out_c']), dtype=np.int32)
-                for oc in range(L_cal['out_c']):
-                    acc_cal[0, oc] = np.dot(in_flat[:L_cal['in_c']].astype(np.int32),
-                                            w[oc].astype(np.int32))
-                    acc_cal[0, oc] += L_cal['bias'][oc]
-                h_out_cal, w_out_cal = 1, 1
-
-                if L_cal['name'] == 'classifier':
-                    cls_acc_per_image.append(acc_cal[0].copy())
-
-            elif is_dw:
-                n_ch = L_cal['in_c']
-                h_out_cal = (cur_h_cal + 2*P - K) // S + 1
-                w_out_cal = (cur_w_cal + 2*P - K) // S + 1
-                w_k = L_cal['weights_int8'].reshape(n_ch, K*K)
-                acc_cal = np.zeros((h_out_cal*w_out_cal, n_ch), dtype=np.int32)
-                if P > 0:
-                    padded = np.zeros((cur_h_cal+2*P, cur_w_cal+2*P, n_ch), dtype=np.int8)
-                    padded[P:P+cur_h_cal, P:P+cur_w_cal, :] = act_cal
-                else:
-                    padded = act_cal
-                for ch in range(n_ch):
-                    for oh in range(h_out_cal):
-                        for ow in range(w_out_cal):
-                            patch = padded[oh*S:oh*S+K, ow*S:ow*S+K, ch].flatten()
-                            acc_cal[oh*w_out_cal+ow, ch] = np.dot(
-                                patch.astype(np.int32), w_k[ch].astype(np.int32))
-                            acc_cal[oh*w_out_cal+ow, ch] += L_cal['bias'][ch]
-            else:
-                patches_cal, h_out_cal, w_out_cal = _im2col(act_cal, K, S, P)
-                if L_cal['quant'] == 'QUANT_INT8':
-                    w = L_cal['weights_int8'].reshape(L_cal['out_c'], -1)
-                    acc_cal = patches_cal.astype(np.int32) @ w.astype(np.int32).T
-                    for oc in range(L_cal['out_c']):
-                        acc_cal[:, oc] += L_cal['bias'][oc]
-                else:
-                    cin_pad = (L_cal['in_c'] + 63) & ~63
-                    num_w = L_cal['out_c'] * K * K * cin_pad
-                    tern_f = unpack_ternary_weights(
-                        L_cal['weights_packed'], num_w, L_cal['scale_pos'], L_cal['scale_neg'])
-                    ts = np.sign(tern_f).astype(np.int8).reshape(L_cal['out_c'], K*K*cin_pad)
-                    ac = K * K * L_cal['in_c']
-                    acc_cal = patches_cal[:, :ac].astype(np.int32) @ ts[:, :ac].astype(np.int32).T
-                    for oc in range(L_cal['out_c']):
-                        acc_cal[:, oc] += L_cal['bias'][oc]
-
-            rq = L_cal['requant_per_ch']
-            out_cal = np.zeros_like(acc_cal, dtype=np.int8)
-            for oc in range(acc_cal.shape[1]):
-                fval = acc_cal[:, oc].astype(np.float64) * rq[oc]
-                ival = np.where(fval >= 0, np.floor(fval + 0.5), np.ceil(fval - 0.5))
-                out_cal[:, oc] = np.clip(ival, -128, 127).astype(np.int8)
-
-            if li_cal < len(layers) - 1:
-                out_cal = np.maximum(out_cal, np.int8(0))
-
-            act_cal = out_cal.reshape(h_out_cal, w_out_cal, L_cal['out_c'])
-            cur_h_cal, cur_w_cal = h_out_cal, w_out_cal
-
-    cls_acc_arr = np.array(cls_acc_per_image)  # [N, 2]
-    # Compute mean acc difference: positive = class0 dominant, negative = class1 dominant
-    mean_acc = cls_acc_arr.mean(axis=0)
-    print(f"  Mean classifier acc: class0={mean_acc[0]:.0f} class1={mean_acc[1]:.0f}")
-
-    # Grid search for optimal classifier bias offset
-    best_acc = 0
-    best_offset = 0
-    for offset in range(0, 50001, 500):
-        correct = 0
-        for idx in range(len(cal_images)):
-            c0 = cls_acc_arr[idx, 0] + offset
-            c1 = cls_acc_arr[idx, 1] - offset
-            pred_cat = c0 > c1
-            if (pred_cat and cal_labels[idx] == 0) or (not pred_cat and cal_labels[idx] == 1):
-                correct += 1
-        if correct > best_acc:
-            best_acc = correct
-            best_offset = offset
-
-    cls_layer['bias'] = np.array([best_offset, -best_offset], dtype=np.int32)
-    print(f"  Best classifier bias: [{best_offset}, {-best_offset}] -> {best_acc}/{len(cal_images)} = {best_acc/len(cal_images)*100:.1f}%")
-
 
 def extract_layers(model, threshold_ratio=0.05):
     """Walk model and extract layer configs with packed weights."""
@@ -637,6 +527,7 @@ def extract_layers(model, threshold_ratio=0.05):
                     "weights_packed": packed,
                     "scale_pos": sp, "scale_neg": sn,
                     "bias": bias_i32,
+                    "_float_bias": bn_bias_val.cpu().numpy().copy(),
                     "requant_per_ch": np.ones(n_oc, dtype=np.float32),  # placeholder
                     "in_c": conv.module.in_channels, "out_c": n_oc,
                     "kernel": conv.module.kernel_size[0],
@@ -685,12 +576,14 @@ def extract_layers(model, threshold_ratio=0.05):
         "requant_scale": 1.0, "requant_zp": 0,
     })
 
-    # Classifier (INT8, per-channel)
-    # Classifier bias is tiny (0.002, 0.058) — set to zero and let requant handle ordering
+    # Classifier (INT8, per-channel) — preserve trained bias
     classifier = model.classifier
     w_cls = classifier.weight.data
     w_int8_cls, w_scale_per_ch = pack_int8_weights_per_channel(w_cls)
-    bias_i32 = np.zeros(classifier.out_features, dtype=np.int32)
+    # Bias in accumulator domain: bias_i32 = float_bias / w_scale_per_ch (approx)
+    safe_ws = np.where(w_scale_per_ch < 1e-10, 1e-10, w_scale_per_ch)
+    float_bias_cls = classifier.bias.data.cpu().numpy()
+    bias_i32 = np.round(float_bias_cls / safe_ws).astype(np.int32)
 
     n_cls = classifier.out_features
     layers.append({
@@ -718,14 +611,118 @@ def extract_layers(model, threshold_ratio=0.05):
             est_acc = max(1.0, np.sqrt(fan) * 40.0)
             L['requant_per_ch'][:] = 127.0 / est_acc
 
-    # Calibrate requant with original biases (keeps consistent activations)
+    # Use sequential calibration (measures actual INT32 accumulator ranges)
     _sequential_calibration(layers)
+    return layers
 
-    # After calibration: zero intermediate biases (they're approximately wrong
-    # but the requant was computed with them in place)
-    for L in layers:
-        if 'bias' in L and L['name'] != 'classifier':
-            L['bias'] = np.zeros_like(L['bias'])
+    # DISABLED: QAT-learned scales approach (doesn't match integer accumulator ranges)
+    from quantize import FakeQuantize as FQ
+    fq_modules = []
+    for n, m in model.named_modules():
+        if isinstance(m, FQ) and m.running_absmax is not None:
+            fq_modules.append((n, m))
+
+    if fq_modules:
+        print(f"[export] Using {len(fq_modules)} QAT-learned scales for requant")
+        # Each FakeQuantize has running_absmax[C] = per-channel output range
+        # The requant must convert INT32 accumulator → INT8 output
+        # output_float = acc_int32 * (input_scale * weight_scale)
+        # output_int8 = output_float / (absmax/127) = acc * input_scale * weight_scale * 127 / absmax
+        # So requant_per_ch[c] = input_scale * weight_scale_per_ch[c] * 127 / absmax[c]
+        #
+        # But we DON'T KNOW input_scale (the effective float-per-int8 of the input).
+        # HOWEVER: we can compute it from the PREVIOUS layer's absmax!
+        # input_scale = prev_absmax / 127 (since prev layer maps its output to [-127,127] via its own FQ)
+        #
+        # So: requant[c] = (prev_absmax_mean / 127) * w_scale[c] * 127 / absmax[c]
+        #                = prev_absmax_mean * w_scale[c] / absmax[c]
+
+        # For first conv: input is firmware-normalized, input_scale = max_normalized / 127
+        input_absmax = 2.64  # max ImageNet normalized value
+
+        fq_idx = 0
+        for li, L in enumerate(layers):
+            if L['type'] == 'LAYER_GLOBAL_AVG_POOL':
+                continue
+            if 'requant_per_ch' not in L:
+                continue
+            if fq_idx >= len(fq_modules):
+                break
+
+            _, fq = fq_modules[fq_idx]
+            out_absmax = fq.running_absmax.cpu().numpy()  # [C_out]
+            out_absmax = np.where(out_absmax < 1e-8, 1e-8, out_absmax)
+
+            if L['quant'] == 'QUANT_INT8':
+                # For INT8: acc = sum(input_int8 * weight_int8) + bias
+                # Float equiv: acc * (input_absmax/127) * w_scale_per_ch[c]
+                # → INT8: acc * (input_absmax/127) * w_scale[c] * (127/out_absmax[c])
+                # = acc * input_absmax * w_scale[c] / out_absmax[c]
+                # Get per-channel w_scale from the layer's weights
+                w_all = L['weights_int8']
+                n_oc = L['out_c']
+                w_per_ch = w_all.reshape(n_oc, -1)
+                w_scale_per_ch = np.array([np.abs(w_per_ch[oc]).max() / 127.0 if np.abs(w_per_ch[oc]).max() > 0 else 1e-10 for oc in range(n_oc)])
+                # Wait — weights are already INT8 quantized per channel, so w_scale is implicit
+                # The actual weight float = weight_int8 * w_scale_per_ch
+                # But pack_int8_weights_per_channel already divided by w_scale, so weight_int8 ≈ round(w_float / w_scale)
+                # acc = sum(input_int8 * weight_int8) → float = acc * (input_absmax/127) * w_scale_per_ch
+                # Actually, w_scale_per_ch was used to quantize the weights, so we stored it.
+                # But it was returned as the second output of pack_int8_weights_per_channel.
+                # It's stored as L['weight_scale'] (max), not per-channel...
+                # We need to recover per-channel scales. They equal absmax(w_float_per_ch) / 127.
+                # Let me just compute: w_scale_per_ch already implicit in the int8 weights.
+                # Since weight_int8[oc] ≈ round(w_float[oc] / scale[oc]):
+                # We don't have w_float anymore, but we have weight_int8 with max abs = 127 per channel.
+                # So the effective per-channel w_scale is whatever makes int8 max = 127.
+                # That means w_scale_per_ch = w_float_absmax_per_ch / 127.
+                # We don't have w_float but we can use the w_scale stored during construction.
+                # Problem: we only stored max(w_scale_per_ch), not the per-channel values.
+
+                # Simplest correct approach: w_int8 has max abs = 127 per channel.
+                # So effective w_scale per channel = (original float absmax) / 127.
+                # We can't recover this from int8 alone.
+                # Let me just use L['weight_scale'] (the global max) as an approximation.
+                w_s = L['weight_scale']  # global max
+                rq = (input_absmax / 127.0) * w_s * (127.0 / out_absmax)
+            else:
+                # Ternary: acc = sum(input_int8 * {-1,0,+1}) → float = acc * (input_absmax/127) * avg_tern_scale * bn_s
+                # But bn_s is per-channel and folded into requant...
+                # Simplified: just use the relationship requant = input_absmax * effective_scale / out_absmax
+                avg_ts = (L.get('scale_pos', 0.1) + L.get('scale_neg', 0.1)) / 2.0
+                rq = (input_absmax / 127.0) * avg_ts * (127.0 / out_absmax)
+
+            # Clamp requant to reasonable range (avoid overflow from near-zero absmax)
+            rq = np.clip(rq, 1e-6, 1.0)
+            L['requant_per_ch'] = rq.astype(np.float32)
+            print(f"  L{li} {L['name']:25s} requant=[{rq.min():.4f}, {rq.max():.4f}]")
+
+            # Next layer's INT8 input has values in [-127, 127]
+            # The float value of each INT8 unit = out_absmax / 127 (from this layer's FQ)
+            # For the requant formula: input_absmax = max(out_absmax) (the float range)
+            # This represents what float value INT8=127 corresponds to
+            input_absmax = float(out_absmax.max())
+            fq_idx += 1
+        # Handle classifier which has no FakeQuantize
+        for li, L in enumerate(layers):
+            if L['name'] == 'classifier' and 'requant_per_ch' in L:
+                    w_s = L['weight_scale']
+                    # Classifier output doesn't have a FakeQuantize, so use a generous out_scale
+                    # We just need the two logits to have the right relative ordering
+                    # Use requant = input_absmax * w_s / (generous_output_range)
+                    # generous_output_range = input_absmax * w_s * 127 (full accumulator range)
+                    # → requant = 1/127 ≈ 0.00787
+                    # Or simpler: requant = 127 / (358 * 127 * input_scale_per_unit)
+                    # where input_scale_per_unit = input_absmax / 127
+                    # → requant = 1 / (358 * input_absmax / 127) = 127 / (358 * input_absmax)
+                    rq_cls = 127.0 / (L['in_c'] * input_absmax / 127.0 * 127.0)
+                    # Simplified: rq_cls = 127.0 / (L['in_c'] * input_absmax)
+                    rq_cls = 127.0 / (L['in_c'] * max(input_absmax, 1.0))
+                    L['requant_per_ch'] = np.full(L['out_c'], rq_cls, dtype=np.float32)
+                    print(f"  Classifier requant: {rq_cls:.6f}")
+    else:
+        print("[export] No QAT scales found, falling back to sequential calibration")
+        _sequential_calibration(layers)
 
     return layers
 

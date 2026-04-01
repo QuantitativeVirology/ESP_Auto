@@ -22,12 +22,17 @@ from train_baseline import MobileNetV1, get_loaders
 # ---------------------------------------------------------------------------
 
 class FakeQuantizeFunction(torch.autograd.Function):
-    """Simulate INT8 quantization: quantize then dequantize, STE backward."""
+    """Simulate per-channel INT8 quantization matching deployment requant."""
 
     @staticmethod
     def forward(ctx, x):
-        # Per-tensor quantize-dequantize to match firmware requant behavior
-        absmax = x.abs().max().clamp(min=1e-8)
+        # Per-channel quantize-dequantize on channel dim (dim=1 for NCHW)
+        if x.dim() == 4:  # [N, C, H, W]
+            absmax = x.abs().amax(dim=(0, 2, 3), keepdim=True).clamp(min=1e-8)
+        elif x.dim() == 2:  # [N, C] for classifier
+            absmax = x.abs().amax(dim=0, keepdim=True).clamp(min=1e-8)
+        else:
+            absmax = x.abs().max().clamp(min=1e-8)
         scale = absmax / 127.0
         x_q = torch.clamp(torch.round(x / scale), -128, 127)
         return x_q * scale
@@ -43,10 +48,27 @@ class FakeQuantize(nn.Module):
     def __init__(self):
         super().__init__()
         self.enabled = False
+        # Track running absmax per channel for export
+        self.register_buffer('running_absmax', None)
+        self.momentum = 0.1
 
     def forward(self, x):
-        if self.enabled and self.training:
-            return FakeQuantizeFunction.apply(x)
+        if self.enabled:
+            result = FakeQuantizeFunction.apply(x)
+            # Update running absmax for export
+            with torch.no_grad():
+                if x.dim() == 4:
+                    absmax = x.abs().amax(dim=(0, 2, 3))
+                elif x.dim() == 2:
+                    absmax = x.abs().amax(dim=0)
+                else:
+                    absmax = x.abs().max().unsqueeze(0)
+
+                if self.running_absmax is None or self.running_absmax.shape != absmax.shape:
+                    self.running_absmax = absmax.clone()
+                else:
+                    self.running_absmax = (1 - self.momentum) * self.running_absmax + self.momentum * absmax
+            return result
         return x
 
 
