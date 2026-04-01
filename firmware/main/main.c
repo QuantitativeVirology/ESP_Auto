@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -57,11 +58,26 @@ static void run_benchmark(void)
     int correct = 0;
     uint32_t total_us = 0;
 
+    // ImageNet normalization: int8 = clamp((pixel/255 - mean) / std * 127, -128, 127)
+    static const float norm_scale[3] = { 127.0f / (255.0f * 0.229f),
+                                          127.0f / (255.0f * 0.224f),
+                                          127.0f / (255.0f * 0.225f) };
+    static const float norm_offset[3] = { -0.485f / 0.229f * 127.0f,
+                                           -0.456f / 0.224f * 127.0f,
+                                           -0.406f / 0.225f * 127.0f };
+
     for (int i = 0; i < NUM_TEST_IMAGES; i++) {
-        // Convert uint8 [0,255] to int8 [-128,127]
+        // Normalize uint8 [0,255] → ImageNet-normalized int8
         static int8_t input_buf[96 * 96 * 3] __attribute__((aligned(16)));
-        for (int j = 0; j < 96 * 96 * 3; j++) {
-            input_buf[j] = (int8_t)(test_images[i][j] - 128);
+        for (int p = 0; p < 96 * 96; p++) {
+            for (int c = 0; c < 3; c++) {
+                int idx = p * 3 + c;
+                float val = test_images[i][idx] * norm_scale[c] + norm_offset[c];
+                int32_t ival = (int32_t)(val + 0.5f);
+                if (ival < -128) ival = -128;
+                if (ival > 127) ival = 127;
+                input_buf[idx] = (int8_t)ival;
+            }
         }
 
         gpio_set_level(PIN_FRAME, 1);
@@ -88,8 +104,8 @@ static void run_benchmark(void)
     uint32_t avg_latency = total_us / NUM_TEST_IMAGES;
     size_t sram_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 
-    printf("METRIC latency_us=%u accuracy=%.4f sram_free=%u\n",
-           avg_latency, accuracy, (unsigned)sram_free);
+    printf("METRIC latency_us=%" PRIu32 " accuracy=%.4f sram_free=%zu\n",
+           avg_latency, accuracy, sram_free);
 }
 #endif
 
@@ -124,9 +140,9 @@ static void inference_task(void *arg)
         uint32_t latency_us = (uint32_t)(end - start);
         float fps = 1000000.0f / latency_us;
 
-        printf("%s  latency=%ums  fps=%.1f\n",
+        printf("%s  latency=%" PRIu32 "ms  fps=%.1f\n",
                result == CLASS_DOG ? "DOG" : "CAT",
-               (unsigned)(latency_us / 1000), fps);
+               latency_us / 1000, fps);
 
         signal_result(result);
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -180,6 +196,9 @@ void app_main(void)
     inference_init();
     inference_print_memory_map();
 
+#ifdef INCLUDE_TEST_IMAGES
+    ESP_LOGI(TAG, "Test images included — skipping camera init for benchmark mode");
+#else
     esp_err_t cam_err = camera_init();
     if (cam_err != ESP_OK) {
         ESP_LOGW(TAG, "Camera init failed — benchmark mode only");
@@ -188,6 +207,7 @@ void app_main(void)
         xTaskCreatePinnedToCore(inference_task, "infer", 8192, NULL,
                                 configMAX_PRIORITIES - 1, NULL, 1);
     }
+#endif
 
     // UART command handler on Core 0
     xTaskCreatePinnedToCore(uart_cmd_task, "uart_cmd", 4096, NULL, 5, NULL, 0);

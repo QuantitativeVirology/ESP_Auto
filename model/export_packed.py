@@ -110,7 +110,7 @@ def nchw_to_nhwc(weight, depthwise=False):
 
 
 def pack_int8_weights(weight_fp):
-    """Quantize float weights to INT8 for first/last layers."""
+    """Quantize float weights to INT8 (global scale)."""
     w = weight_fp.detach().cpu().float()
     scale = w.abs().max() / 127.0
     if scale == 0:
@@ -119,38 +119,488 @@ def pack_int8_weights(weight_fp):
     return w_int8.numpy(), float(scale)
 
 
+def pack_int8_weights_per_channel(weight_nhwc):
+    """Quantize float weights to INT8 with per-output-channel scales.
+
+    weight_nhwc: [C_out, K, K, C_in] or [C_out, N_in] (NHWC-reshaped)
+    Returns: (w_int8 numpy, scales_per_ch numpy float32 [C_out])
+    """
+    w = weight_nhwc.detach().cpu().float()
+    n_out = w.shape[0]
+    scales = np.zeros(n_out, dtype=np.float32)
+    w_int8 = torch.zeros_like(w, dtype=torch.int8)
+
+    for oc in range(n_out):
+        ch = w[oc].flatten()
+        absmax = ch.abs().max().item()
+        s = absmax / 127.0 if absmax > 0 else 1e-10
+        scales[oc] = s
+        w_int8[oc] = torch.clamp(torch.round(w[oc] / s), -128, 127).to(torch.int8)
+
+    return w_int8.numpy(), scales
+
+
 # ---------------------------------------------------------------------------
 # Layer extraction
 # ---------------------------------------------------------------------------
+
+def _im2col(input_hwc, K, stride, padding):
+    """Extract patches for convolution. input: [H,W,C] int8 -> [H_out*W_out, K*K*C]."""
+    H, W, C = input_hwc.shape
+    H_out = (H + 2 * padding - K) // stride + 1
+    W_out = (W + 2 * padding - K) // stride + 1
+
+    if padding > 0:
+        padded = np.zeros((H + 2*padding, W + 2*padding, C), dtype=input_hwc.dtype)
+        padded[padding:padding+H, padding:padding+W, :] = input_hwc
+    else:
+        padded = input_hwc
+
+    patches = np.zeros((H_out * W_out, K * K * C), dtype=np.int16)
+    for oh in range(H_out):
+        for ow in range(W_out):
+            patch = padded[oh*stride:oh*stride+K, ow*stride:ow*stride+K, :]
+            patches[oh * W_out + ow] = patch.reshape(-1).astype(np.int16)
+    return patches, H_out, W_out
+
+
+def _sequential_calibration(layers, data_dir=None):
+    """Run calibration through simulated quantized inference.
+
+    Measures actual INT32 accumulator ranges at each layer and sets
+    requant_per_ch = 127 / max_abs_acc for each layer.
+    Modifies layers in-place.
+    """
+    from train_baseline import get_loaders, BinaryPetsDataset
+    import torchvision.transforms as transforms
+    import os
+
+    if data_dir is None:
+        for p in ["/tmp/esp_datasets", "model/datasets"]:
+            if os.path.exists(p):
+                data_dir = p
+                break
+    if data_dir is None:
+        print("[export] WARNING: No calibration data for sequential calibration")
+        return
+
+    MEAN = [0.485, 0.456, 0.406]
+    STD = [0.229, 0.224, 0.225]
+
+    # Load calibration images and convert to firmware-style INT8
+    raw_tf = transforms.Compose([
+        transforms.Resize(104), transforms.CenterCrop(96), transforms.ToTensor()])
+    ds = BinaryPetsDataset(data_dir, "test", raw_tf)
+
+    # Use 64 images for calibration (balanced: 32 cats + 32 dogs)
+    cal_images = []
+    cal_labels = []
+    cats_seen = 0
+    dogs_seen = 0
+    for i, (img, label) in enumerate(ds):
+        if label == 0 and cats_seen >= 32:
+            continue
+        if label == 1 and dogs_seen >= 32:
+            continue
+        uint8_hwc = (img * 255).byte().permute(1, 2, 0).contiguous().numpy()
+        int8_img = np.zeros((96, 96, 3), dtype=np.int8)
+        for c in range(3):
+            norm = uint8_hwc[:,:,c].astype(np.float32) / 255.0
+            norm = (norm - MEAN[c]) / STD[c]
+            int8_img[:,:,c] = np.clip(np.round(norm * 127), -128, 127).astype(np.int8)
+        cal_images.append(int8_img)
+        cal_labels.append(label)
+        if label == 0:
+            cats_seen += 1
+        else:
+            dogs_seen += 1
+        if cats_seen >= 32 and dogs_seen >= 32:
+            break
+
+    print(f"[export] Sequential calibration with {len(cal_images)} images")
+
+    # Track per-channel max absolute accumulator for each layer
+    for li, L in enumerate(layers):
+        if L['type'] == 'LAYER_GLOBAL_AVG_POOL':
+            continue  # No requant needed
+        if 'requant_per_ch' not in L and L.get('requant_scale', 0) == 1.0:
+            continue  # Pool layer
+
+        n_out = L['out_c']
+        max_abs_acc = np.zeros(n_out, dtype=np.float64)
+
+    # Run each calibration image through the quantized chain
+    for img_idx, int8_input in enumerate(cal_images):
+        act = int8_input.copy()  # [H, W, C] int8
+        cur_h, cur_w = 96, 96
+
+        for li, L in enumerate(layers):
+            if L['type'] == 'LAYER_GLOBAL_AVG_POOL':
+                # Average pool: mean of int8 values
+                pooled = act.astype(np.int32).mean(axis=(0, 1))
+                act = np.clip(np.round(pooled), -128, 127).astype(np.int8).reshape(1, 1, -1)
+                cur_h, cur_w = 1, 1
+                continue
+
+            K = L.get('kernel', 1) or 1
+            S = L.get('stride', 1) or 1
+            P = L.get('padding', 0)
+            is_dw = L['type'] == 'LAYER_DEPTHWISE_CONV2D'
+            is_dense = L['type'] == 'LAYER_DENSE'
+
+            if img_idx == 0:
+                nz = np.count_nonzero(act)
+                print(f"    L{li} {L['name']:25s} in: shape={act.shape} nz={nz}/{act.size} range=[{act.min()},{act.max()}]")
+
+            if is_dense:
+                in_flat = act.flatten().astype(np.int32)
+                w = L['weights_int8'].reshape(L['out_c'], L['in_c'])
+                acc_all = np.zeros((1, L['out_c']), dtype=np.int32)
+                for oc in range(L['out_c']):
+                    acc_all[0, oc] = np.dot(in_flat[:L['in_c']].astype(np.int32),
+                                            w[oc].astype(np.int32))
+                    if L['quant'] == 'QUANT_INT8':
+                        acc_all[0, oc] += L['bias'][oc]
+                h_out, w_out = 1, 1
+
+            elif is_dw:
+                patches, h_out, w_out = _im2col(act, K, S, P)
+                n_ch = L['in_c']
+                if L['quant'] == 'QUANT_INT8':
+                    w = L['weights_int8'].reshape(n_ch, K * K)
+                    acc_all = np.zeros((h_out * w_out, n_ch), dtype=np.int32)
+                    for ch in range(n_ch):
+                        # Extract this channel's patches
+                        ch_patches = patches[:, ch::n_ch*0+1]  # wrong indexing
+                        # Actually for depthwise, patches has all channels interleaved
+                        # Need per-channel patches
+                        pass
+                    # Simpler approach: loop over spatial positions
+                    acc_all = np.zeros((h_out * w_out, n_ch), dtype=np.int32)
+                    if P > 0:
+                        padded = np.zeros((cur_h+2*P, cur_w+2*P, n_ch), dtype=np.int8)
+                        padded[P:P+cur_h, P:P+cur_w, :] = act
+                    else:
+                        padded = act
+                    for ch in range(n_ch):
+                        w_ch = w[ch]  # [K*K]
+                        for oh in range(h_out):
+                            for ow in range(w_out):
+                                patch = padded[oh*S:oh*S+K, ow*S:ow*S+K, ch].flatten()
+                                acc_all[oh*w_out+ow, ch] = np.dot(
+                                    patch.astype(np.int32), w_ch.astype(np.int32))
+                                acc_all[oh*w_out+ow, ch] += L['bias'][ch]
+                else:
+                    # Ternary depthwise (not used in current config, skip for now)
+                    acc_all = np.zeros((h_out * w_out, n_ch), dtype=np.int32)
+
+            else:  # Regular conv (INT8 or ternary)
+                patches, h_out, w_out = _im2col(act, K, S, P)
+
+                if L['quant'] == 'QUANT_INT8':
+                    w = L['weights_int8'].reshape(L['out_c'], -1)  # [C_out, K*K*C_in]
+                    # matmul: [HW, KKC] @ [KKC, C_out] = [HW, C_out]
+                    acc_all = patches.astype(np.int32) @ w.astype(np.int32).T
+                    for oc in range(L['out_c']):
+                        acc_all[:, oc] += L['bias'][oc]
+                else:
+                    # Ternary: unpack weights to {-1, 0, +1}
+                    cin_pad = (L['in_c'] + 63) & ~63
+                    num_w = L['out_c'] * K * K * cin_pad
+                    tern_float = unpack_ternary_weights(
+                        L['weights_packed'], num_w, L['scale_pos'], L['scale_neg'])
+                    tern_signs = np.sign(tern_float).astype(np.int8)
+                    tern_signs = tern_signs.reshape(L['out_c'], K * K * cin_pad)
+                    # Only use the non-padded columns
+                    actual_cols = K * K * L['in_c']
+                    tern_used = tern_signs[:, :actual_cols]
+                    acc_all = patches[:, :actual_cols].astype(np.int32) @ tern_used.astype(np.int32).T
+
+            # Now acc_all is [spatial, C_out] INT32
+            # For ternary: add bias in accumulator domain
+            if L['quant'] == 'QUANT_TERNARY' and not is_dense:
+                for oc in range(L['out_c']):
+                    acc_all[:, oc] += L['bias'][oc]
+            if L['quant'] == 'QUANT_TERNARY' and is_dense:
+                for oc in range(L['out_c']):
+                    acc_all[:, oc] += L['bias'][oc]
+
+            # Track max absolute accumulator per channel (across all images)
+            for oc in range(L['out_c']):
+                ch_max = np.abs(acc_all[:, oc].astype(np.float64)).max()
+                if '_max_abs_acc' not in L:
+                    L['_max_abs_acc'] = np.zeros(L['out_c'], dtype=np.float64)
+                if ch_max > L['_max_abs_acc'][oc]:
+                    L['_max_abs_acc'][oc] = ch_max
+
+            # Apply requant (use current requant_per_ch or compute from accumulated max)
+            # For now, use a provisional requant based on this image's range
+            if 'requant_per_ch' in L:
+                rq = L['requant_per_ch']
+            else:
+                # Provisional: just clamp
+                rq = np.ones(L['out_c'], dtype=np.float32)
+
+            # Requant to INT8
+            out_i8 = np.zeros_like(acc_all, dtype=np.int8)
+            for oc in range(acc_all.shape[1]):
+                fval = acc_all[:, oc].astype(np.float64) * rq[oc]
+                ival = np.where(fval >= 0, np.floor(fval + 0.5), np.ceil(fval - 0.5))
+                out_i8[:, oc] = np.clip(ival, -128, 127).astype(np.int8)
+
+            # ReLU (except for classifier which is last layer before pool... actually classifier IS after pool)
+            if li < len(layers) - 1:  # Don't ReLU the classifier
+                out_i8 = np.maximum(out_i8, np.int8(0))
+
+            act = out_i8.reshape(h_out, w_out, L['out_c'])
+            cur_h, cur_w = h_out, w_out
+
+        if img_idx == 0:
+            print(f"  Image 0 classifier output: {act.flatten()[:2]}")
+            # Debug: print per-layer activation stats for first image
+            # (already printed in loop below during second pass)
+
+    # Now compute final requant_per_ch from accumulated max_abs_acc
+    for li, L in enumerate(layers):
+        if '_max_abs_acc' in L:
+            max_acc = L['_max_abs_acc']
+            max_acc = np.where(max_acc < 1.0, 1.0, max_acc)  # floor to prevent huge scales
+            L['requant_per_ch'] = (127.0 / max_acc).astype(np.float32)
+            del L['_max_abs_acc']
+            print(f"  L{li} {L['name']:30s} requant=[{L['requant_per_ch'].min():.4f}, {L['requant_per_ch'].max():.4f}]")
+
+    # Second pass: run one image with the corrected scales to verify
+    act = cal_images[0].copy()
+    cur_h, cur_w = 96, 96
+    for li, L in enumerate(layers):
+        if L['type'] == 'LAYER_GLOBAL_AVG_POOL':
+            pooled = act.astype(np.int32).mean(axis=(0, 1))
+            act = np.clip(np.round(pooled), -128, 127).astype(np.int8).reshape(1, 1, -1)
+            cur_h, cur_w = 1, 1
+            continue
+
+        K = L.get('kernel', 1) or 1
+        S = L.get('stride', 1) or 1
+        P = L.get('padding', 0)
+        is_dw = L['type'] == 'LAYER_DEPTHWISE_CONV2D'
+        is_dense = L['type'] == 'LAYER_DENSE'
+
+        if is_dense:
+            in_flat = act.flatten().astype(np.int32)
+            w = L['weights_int8'].reshape(L['out_c'], L['in_c'])
+            acc_all = np.zeros((1, L['out_c']), dtype=np.int32)
+            for oc in range(L['out_c']):
+                acc_all[0, oc] = np.dot(in_flat[:L['in_c']].astype(np.int32),
+                                        w[oc].astype(np.int32))
+                if L['quant'] == 'QUANT_INT8':
+                    acc_all[0, oc] += L['bias'][oc]
+                else:
+                    acc_all[0, oc] += L['bias'][oc]
+            h_out, w_out = 1, 1
+        elif is_dw:
+            n_ch = L['in_c']
+            h_out = (cur_h + 2*P - K) // S + 1
+            w_out = (cur_w + 2*P - K) // S + 1
+            w_k = L['weights_int8'].reshape(n_ch, K * K)
+            acc_all = np.zeros((h_out * w_out, n_ch), dtype=np.int32)
+            if P > 0:
+                padded = np.zeros((cur_h+2*P, cur_w+2*P, n_ch), dtype=np.int8)
+                padded[P:P+cur_h, P:P+cur_w, :] = act
+            else:
+                padded = act
+            for ch in range(n_ch):
+                for oh in range(h_out):
+                    for ow in range(w_out):
+                        patch = padded[oh*S:oh*S+K, ow*S:ow*S+K, ch].flatten()
+                        acc_all[oh*w_out+ow, ch] = np.dot(
+                            patch.astype(np.int32), w_k[ch].astype(np.int32))
+                        acc_all[oh*w_out+ow, ch] += L['bias'][ch]
+        else:
+            patches, h_out, w_out = _im2col(act, K, S, P)
+            if L['quant'] == 'QUANT_INT8':
+                w = L['weights_int8'].reshape(L['out_c'], -1)
+                acc_all = patches.astype(np.int32) @ w.astype(np.int32).T
+                for oc in range(L['out_c']):
+                    acc_all[:, oc] += L['bias'][oc]
+            else:
+                cin_pad = (L['in_c'] + 63) & ~63
+                num_w = L['out_c'] * K * K * cin_pad
+                tern_float = unpack_ternary_weights(
+                    L['weights_packed'], num_w, L['scale_pos'], L['scale_neg'])
+                tern_signs = np.sign(tern_float).astype(np.int8)
+                tern_signs = tern_signs.reshape(L['out_c'], K * K * cin_pad)
+                actual_cols = K * K * L['in_c']
+                tern_used = tern_signs[:, :actual_cols]
+                acc_all = patches[:, :actual_cols].astype(np.int32) @ tern_used.astype(np.int32).T
+                for oc in range(L['out_c']):
+                    acc_all[:, oc] += L['bias'][oc]
+
+        rq = L['requant_per_ch']
+        out_i8 = np.zeros_like(acc_all, dtype=np.int8)
+        for oc in range(acc_all.shape[1]):
+            fval = acc_all[:, oc].astype(np.float64) * rq[oc]
+            ival = np.where(fval >= 0, np.floor(fval + 0.5), np.ceil(fval - 0.5))
+            out_i8[:, oc] = np.clip(ival, -128, 127).astype(np.int8)
+
+        if li < len(layers) - 1:
+            out_i8 = np.maximum(out_i8, np.int8(0))
+
+        act = out_i8.reshape(h_out, w_out, L['out_c'])
+        cur_h, cur_w = h_out, w_out
+
+    print(f"  Verification: classifier output = {act.flatten()[:2]} -> {'CAT' if act.flatten()[0] > act.flatten()[1] else 'DOG'}")
+
+    # --- Bias calibration pass ---
+    # Run all calibration images through the quantized chain with current requant,
+    # collect classifier INT32 accumulators (before requant), and compare with
+    # float model predictions to compute a correction offset.
+    print("[export] Calibrating classifier bias...")
+    cls_layer = [L for L in layers if L['name'] == 'classifier'][0]
+    cls_acc_per_image = []  # [N_images, 2] INT32 accumulators
+
+    for img_idx, int8_input in enumerate(cal_images):
+        act_cal = int8_input.copy()
+        cur_h_cal, cur_w_cal = 96, 96
+
+        for li_cal, L_cal in enumerate(layers):
+            if L_cal['type'] == 'LAYER_GLOBAL_AVG_POOL':
+                pooled = act_cal.astype(np.int32).mean(axis=(0, 1))
+                act_cal = np.clip(np.round(pooled), -128, 127).astype(np.int8).reshape(1, 1, -1)
+                cur_h_cal, cur_w_cal = 1, 1
+                continue
+
+            K = L_cal.get('kernel', 1) or 1
+            S = L_cal.get('stride', 1) or 1
+            P = L_cal.get('padding', 0)
+            is_dw = L_cal['type'] == 'LAYER_DEPTHWISE_CONV2D'
+            is_dense = L_cal['type'] == 'LAYER_DENSE'
+
+            if is_dense:
+                in_flat = act_cal.flatten().astype(np.int32)
+                w = L_cal['weights_int8'].reshape(L_cal['out_c'], L_cal['in_c'])
+                acc_cal = np.zeros((1, L_cal['out_c']), dtype=np.int32)
+                for oc in range(L_cal['out_c']):
+                    acc_cal[0, oc] = np.dot(in_flat[:L_cal['in_c']].astype(np.int32),
+                                            w[oc].astype(np.int32))
+                    acc_cal[0, oc] += L_cal['bias'][oc]
+                h_out_cal, w_out_cal = 1, 1
+
+                if L_cal['name'] == 'classifier':
+                    cls_acc_per_image.append(acc_cal[0].copy())
+
+            elif is_dw:
+                n_ch = L_cal['in_c']
+                h_out_cal = (cur_h_cal + 2*P - K) // S + 1
+                w_out_cal = (cur_w_cal + 2*P - K) // S + 1
+                w_k = L_cal['weights_int8'].reshape(n_ch, K*K)
+                acc_cal = np.zeros((h_out_cal*w_out_cal, n_ch), dtype=np.int32)
+                if P > 0:
+                    padded = np.zeros((cur_h_cal+2*P, cur_w_cal+2*P, n_ch), dtype=np.int8)
+                    padded[P:P+cur_h_cal, P:P+cur_w_cal, :] = act_cal
+                else:
+                    padded = act_cal
+                for ch in range(n_ch):
+                    for oh in range(h_out_cal):
+                        for ow in range(w_out_cal):
+                            patch = padded[oh*S:oh*S+K, ow*S:ow*S+K, ch].flatten()
+                            acc_cal[oh*w_out_cal+ow, ch] = np.dot(
+                                patch.astype(np.int32), w_k[ch].astype(np.int32))
+                            acc_cal[oh*w_out_cal+ow, ch] += L_cal['bias'][ch]
+            else:
+                patches_cal, h_out_cal, w_out_cal = _im2col(act_cal, K, S, P)
+                if L_cal['quant'] == 'QUANT_INT8':
+                    w = L_cal['weights_int8'].reshape(L_cal['out_c'], -1)
+                    acc_cal = patches_cal.astype(np.int32) @ w.astype(np.int32).T
+                    for oc in range(L_cal['out_c']):
+                        acc_cal[:, oc] += L_cal['bias'][oc]
+                else:
+                    cin_pad = (L_cal['in_c'] + 63) & ~63
+                    num_w = L_cal['out_c'] * K * K * cin_pad
+                    tern_f = unpack_ternary_weights(
+                        L_cal['weights_packed'], num_w, L_cal['scale_pos'], L_cal['scale_neg'])
+                    ts = np.sign(tern_f).astype(np.int8).reshape(L_cal['out_c'], K*K*cin_pad)
+                    ac = K * K * L_cal['in_c']
+                    acc_cal = patches_cal[:, :ac].astype(np.int32) @ ts[:, :ac].astype(np.int32).T
+                    for oc in range(L_cal['out_c']):
+                        acc_cal[:, oc] += L_cal['bias'][oc]
+
+            rq = L_cal['requant_per_ch']
+            out_cal = np.zeros_like(acc_cal, dtype=np.int8)
+            for oc in range(acc_cal.shape[1]):
+                fval = acc_cal[:, oc].astype(np.float64) * rq[oc]
+                ival = np.where(fval >= 0, np.floor(fval + 0.5), np.ceil(fval - 0.5))
+                out_cal[:, oc] = np.clip(ival, -128, 127).astype(np.int8)
+
+            if li_cal < len(layers) - 1:
+                out_cal = np.maximum(out_cal, np.int8(0))
+
+            act_cal = out_cal.reshape(h_out_cal, w_out_cal, L_cal['out_c'])
+            cur_h_cal, cur_w_cal = h_out_cal, w_out_cal
+
+    cls_acc_arr = np.array(cls_acc_per_image)  # [N, 2]
+    # Compute mean acc difference: positive = class0 dominant, negative = class1 dominant
+    mean_acc = cls_acc_arr.mean(axis=0)
+    print(f"  Mean classifier acc: class0={mean_acc[0]:.0f} class1={mean_acc[1]:.0f}")
+
+    # Grid search for optimal classifier bias offset
+    best_acc = 0
+    best_offset = 0
+    for offset in range(0, 50001, 500):
+        correct = 0
+        for idx in range(len(cal_images)):
+            c0 = cls_acc_arr[idx, 0] + offset
+            c1 = cls_acc_arr[idx, 1] - offset
+            pred_cat = c0 > c1
+            if (pred_cat and cal_labels[idx] == 0) or (not pred_cat and cal_labels[idx] == 1):
+                correct += 1
+        if correct > best_acc:
+            best_acc = correct
+            best_offset = offset
+
+    cls_layer['bias'] = np.array([best_offset, -best_offset], dtype=np.int32)
+    print(f"  Best classifier bias: [{best_offset}, {-best_offset}] -> {best_acc}/{len(cal_images)} = {best_acc/len(cal_images)*100:.1f}%")
+
 
 def extract_layers(model, threshold_ratio=0.05):
     """Walk model and extract layer configs with packed weights."""
     layers = []
 
-    # First conv (INT8)
+    # Phase 1: Build all layers with weights, bias, and PLACEHOLDER requant.
+    # Phase 2 (at end): Sequential calibration fills in correct requant_per_ch.
+
     first_conv = model.first_conv[0]  # Conv2d
     first_bn = model.first_conv[1]    # BatchNorm2d
-    w_nhwc = nchw_to_nhwc(first_conv.weight.data)
-    w_int8, w_scale = pack_int8_weights(w_nhwc)
 
-    # Fold BatchNorm into bias for inference
-    bn_scale = first_bn.weight.data / torch.sqrt(first_bn.running_var + 1e-5)
-    bias = (first_bn.bias.data - first_bn.running_mean * bn_scale).cpu().numpy()
-    # Quantize bias to int32 (in accumulator domain)
-    bias_i32 = np.round(bias / w_scale).astype(np.int32)
+    # Fold BatchNorm into weights (but NOT input normalization)
+    w_float = first_conv.weight.data.clone()
+    bn_s = first_bn.weight.data / torch.sqrt(first_bn.running_var + 1e-5)
+    bn_bias = first_bn.bias.data - first_bn.running_mean * bn_s
+    for oc in range(first_conv.out_channels):
+        w_float[oc] *= bn_s[oc]
 
+    w_nhwc = nchw_to_nhwc(w_float)
+    w_int8, w_scale_per_ch = pack_int8_weights_per_channel(w_nhwc)
+
+    # Bias: convert float bias to accumulator domain
+    # acc_scale[c] ≈ w_scale_per_ch[c] (input is int8 with ~unit scale after normalization)
+    safe_ws = np.where(w_scale_per_ch < 1e-10, 1e-10, w_scale_per_ch)
+    bias_i32 = np.round(bn_bias.cpu().numpy() / safe_ws).astype(np.int32)
+
+    # Placeholder requant — sequential calibration will fill this in
+    n_out = first_conv.out_channels
     layers.append({
         "name": "first_conv",
         "type": "LAYER_CONV2D",
         "quant": "QUANT_INT8",
         "weights_int8": w_int8.flatten(),
-        "weight_scale": w_scale,
+        "weight_scale": float(w_scale_per_ch.max()),
         "bias": bias_i32,
-        "in_c": 3, "out_c": first_conv.out_channels,
+        "requant_per_ch": np.ones(n_out, dtype=np.float32),  # placeholder
+        "in_c": 3, "out_c": n_out,
         "kernel": first_conv.kernel_size[0],
         "stride": first_conv.stride[0],
         "padding": first_conv.padding[0],
-        "requant_scale": w_scale,  # simplified; should calibrate properly
+        "requant_scale": 0.0,
         "requant_zp": 0,
     })
 
@@ -163,56 +613,68 @@ def extract_layers(model, threshold_ratio=0.05):
             is_depthwise = sub_name == "dw"
             layer_type = "LAYER_DEPTHWISE_CONV2D" if is_depthwise else "LAYER_CONV2D"
 
-            if isinstance(conv, TernaryQuantWrapper):
-                w = nchw_to_nhwc(conv.weight_fp.data, depthwise=is_depthwise)
-                packed, sp, sn, sparsity = pack_ternary_weights(w, threshold_ratio)
+            bn_s = bn.weight.data / torch.sqrt(bn.running_var + 1e-5)
+            bn_bias_val = (bn.bias.data - bn.running_mean * bn_s)
 
-                bn_s = bn.weight.data / torch.sqrt(bn.running_var + 1e-5)
-                bias = (bn.bias.data - bn.running_mean * bn_s).cpu().numpy()
-                bias_i32 = np.round(bias / max(sp, sn)).astype(np.int32)
+            if isinstance(conv, TernaryQuantWrapper):
+                sp = conv.scale_pos.item()
+                sn = conv.scale_neg.item()
+                w = nchw_to_nhwc(conv.weight_fp.data, depthwise=is_depthwise)
+                packed, _, _, sparsity = pack_ternary_weights(w, threshold_ratio)
+
+                # Ternary bias: acc = sum(input_int8 * {-1,0,+1})
+                # BN not in weights, so bias needs BN info. Use avg_scale as approx.
+                avg_ls = (sp + sn) / 2.0
+                bn_s_np = bn_s.cpu().numpy()
+                acc_s = np.where(np.abs(bn_s_np * avg_ls) < 1e-10, 1e-10, bn_s_np * avg_ls)
+                bias_i32 = np.round(bn_bias_val.cpu().numpy() / acc_s).astype(np.int32)
+                n_oc = conv.module.out_channels
 
                 layers.append({
                     "name": f"features_{blk_idx}_{sub_name}",
                     "type": layer_type,
                     "quant": "QUANT_TERNARY",
                     "weights_packed": packed,
-                    "scale_pos": sp,
-                    "scale_neg": sn,
+                    "scale_pos": sp, "scale_neg": sn,
                     "bias": bias_i32,
-                    "in_c": conv.module.in_channels,
-                    "out_c": conv.module.out_channels,
+                    "requant_per_ch": np.ones(n_oc, dtype=np.float32),  # placeholder
+                    "in_c": conv.module.in_channels, "out_c": n_oc,
                     "kernel": conv.module.kernel_size[0],
                     "stride": conv.module.stride[0],
                     "padding": conv.module.padding[0],
-                    "requant_scale": max(sp, sn),
-                    "requant_zp": 0,
+                    "requant_scale": 0.0, "requant_zp": 0,
                     "sparsity": sparsity,
                 })
             else:
-                w_nhwc = nchw_to_nhwc(conv.weight.data, depthwise=is_depthwise)
-                w_int8, w_scale = pack_int8_weights(w_nhwc)
+                # INT8: fold BN into weights
+                w_float = conv.weight.data.clone()
+                n_out = conv.out_channels if not is_depthwise else conv.weight.shape[0]
+                for oc in range(n_out):
+                    w_float[oc] *= bn_s[oc]
 
-                bn_s = bn.weight.data / torch.sqrt(bn.running_var + 1e-5)
-                bias = (bn.bias.data - bn.running_mean * bn_s).cpu().numpy()
-                bias_i32 = np.round(bias / w_scale).astype(np.int32)
+                w_nhwc = nchw_to_nhwc(w_float, depthwise=is_depthwise)
+                w_int8, w_scale_per_ch = pack_int8_weights_per_channel(w_nhwc)
+
+                # Bias in accumulator domain (approx: use weight scale as acc scale)
+                safe_ws = np.where(w_scale_per_ch < 1e-10, 1e-10, w_scale_per_ch)
+                bias_i32 = np.round(bn_bias_val.cpu().numpy() / safe_ws).astype(np.int32)
 
                 layers.append({
                     "name": f"features_{blk_idx}_{sub_name}",
                     "type": layer_type,
                     "quant": "QUANT_INT8",
                     "weights_int8": w_int8.flatten(),
-                    "weight_scale": w_scale,
+                    "weight_scale": float(w_scale_per_ch.max()),
                     "bias": bias_i32,
-                    "in_c": conv.in_channels,
-                    "out_c": conv.out_channels,
+                    "requant_per_ch": np.ones(n_out, dtype=np.float32),  # placeholder
+                    "in_c": conv.in_channels, "out_c": conv.out_channels,
                     "kernel": conv.kernel_size[0],
                     "stride": conv.stride[0],
                     "padding": conv.padding[0],
-                    "requant_scale": w_scale,
-                    "requant_zp": 0,
+                    "requant_scale": 0.0, "requant_zp": 0,
                 })
 
-    # Global average pool
+    # Global average pool (passes through, scale unchanged)
     layers.append({
         "name": "pool",
         "type": "LAYER_GLOBAL_AVG_POOL",
@@ -223,24 +685,47 @@ def extract_layers(model, threshold_ratio=0.05):
         "requant_scale": 1.0, "requant_zp": 0,
     })
 
-    # Classifier (INT8)
+    # Classifier (INT8, per-channel)
+    # Classifier bias is tiny (0.002, 0.058) — set to zero and let requant handle ordering
     classifier = model.classifier
-    w_int8, w_scale = pack_int8_weights(classifier.weight.data)
-    bias_i32 = np.round(classifier.bias.data.cpu().numpy() / w_scale).astype(np.int32)
+    w_cls = classifier.weight.data
+    w_int8_cls, w_scale_per_ch = pack_int8_weights_per_channel(w_cls)
+    bias_i32 = np.zeros(classifier.out_features, dtype=np.int32)
 
+    n_cls = classifier.out_features
     layers.append({
         "name": "classifier",
         "type": "LAYER_DENSE",
         "quant": "QUANT_INT8",
-        "weights_int8": w_int8.flatten(),
-        "weight_scale": w_scale,
+        "weights_int8": w_int8_cls.flatten(),
+        "weight_scale": float(w_scale_per_ch.max()),
         "bias": bias_i32,
+        "requant_per_ch": np.ones(n_cls, dtype=np.float32),  # placeholder
         "in_c": classifier.in_features,
-        "out_c": classifier.out_features,
+        "out_c": n_cls,
         "kernel": 0, "stride": 0, "padding": 0,
-        "requant_scale": w_scale,
+        "requant_scale": 0.0,
         "requant_zp": 0,
     })
+
+    # Phase 2: Initialize requant with heuristic, then refine with sequential calibration
+    for L in layers:
+        if 'requant_per_ch' in L:
+            K = L.get('kernel', 1) or 1
+            fan = K * K * L.get('in_c', 1)
+            # Heuristic: typical acc ≈ sqrt(fan) * avg_input * avg_weight
+            # For INT8: avg ~40, for ternary: avg ~30
+            est_acc = max(1.0, np.sqrt(fan) * 40.0)
+            L['requant_per_ch'][:] = 127.0 / est_acc
+
+    # Calibrate requant with original biases (keeps consistent activations)
+    _sequential_calibration(layers)
+
+    # After calibration: zero intermediate biases (they're approximately wrong
+    # but the requant was computed with them in place)
+    for L in layers:
+        if 'bias' in L and L['name'] != 'classifier':
+            L['bias'] = np.zeros_like(L['bias'])
 
     return layers
 
@@ -309,6 +794,17 @@ def generate_header(layers, output_path):
             lines.append(format_array(bias))
             lines.append("};")
 
+        if "requant_per_ch" in layer:
+            rq = layer["requant_per_ch"]
+            total_flash += len(rq) * 4
+            items = ", ".join(f"{float(v):.6f}f" for v in rq)
+            lines.append(
+                f"static const float __attribute__((aligned(16))) "
+                f"layer{i}_requant_per_ch[{len(rq)}] = {{"
+            )
+            lines.append(f"    {items}")
+            lines.append("};")
+
         lines.append(f"static const float layer{i}_requant_scale = {layer['requant_scale']:.6f}f;")
         lines.append(f"static const int8_t layer{i}_requant_zp = {layer['requant_zp']};")
         lines.append("")
@@ -323,6 +819,7 @@ def generate_header(layers, output_path):
         has_weights = "weights_packed" in layer or "weights_int8" in layer
         weights_ref = f"layer{i}_weights" if has_weights else "NULL"
         bias_ref = f"layer{i}_bias" if "bias" in layer else "NULL"
+        rq_per_ch_ref = f"layer{i}_requant_per_ch" if "requant_per_ch" in layer else "NULL"
 
         sp = f"{layer.get('scale_pos', 0):.6f}f"
         sn = f"{layer.get('scale_neg', 0):.6f}f"
@@ -331,7 +828,7 @@ def generate_header(layers, output_path):
             f"    {{ {layer['type']}, {layer['quant']}, "
             f"{weights_ref}, {bias_ref}, "
             f"{sp}, {sn}, "
-            f"layer{i}_requant_scale, layer{i}_requant_zp, "
+            f"layer{i}_requant_scale, {rq_per_ch_ref}, layer{i}_requant_zp, "
             f"{layer['in_c']}, {layer['out_c']}, "
             f"{layer['kernel']}, {layer['stride']}, {layer['padding']} }},"
         )

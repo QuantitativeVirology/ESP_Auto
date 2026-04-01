@@ -94,9 +94,34 @@ void requantize_i32_to_i8(
     int8_t zero_point)
 {
     for (int i = 0; i < count; i++) {
-        int32_t val = (int32_t)(input[i] * scale + 0.5f) + zero_point;
+        float fval = input[i] * scale;
+        int32_t val = (fval >= 0) ? (int32_t)(fval + 0.5f) : (int32_t)(fval - 0.5f);
+        val += zero_point;
         if (val < -128) val = -128;
         if (val > 127) val = 127;
         output[i] = (int8_t)val;
+    }
+}
+
+void requantize_i32_to_i8_per_channel(
+    const int32_t *input,
+    int8_t *output,
+    int width,
+    int channels,
+    const float *scale,
+    const int32_t *bias,
+    int8_t zero_point)
+{
+    for (int x = 0; x < width; x++) {
+        for (int c = 0; c < channels; c++) {
+            int idx = x * channels + c;
+            int32_t acc = input[idx] + (bias ? bias[c] : 0);
+            float fval = acc * scale[c];
+            int32_t val = (fval >= 0) ? (int32_t)(fval + 0.5f) : (int32_t)(fval - 0.5f);
+            val += zero_point;
+            if (val < -128) val = -128;
+            if (val > 127) val = 127;
+            output[idx] = (int8_t)val;
+        }
     }
 }

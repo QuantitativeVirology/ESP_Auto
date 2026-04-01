@@ -93,7 +93,7 @@ void global_avg_pool(
     int H, int W, int C);
 
 /**
- * Requantize INT32 accumulators to INT8 activations.
+ * Requantize INT32 accumulators to INT8 activations (uniform scale).
  * out[i] = clamp(round(in[i] * scale) + zero_point, -128, 127)
  */
 void requantize_i32_to_i8(
@@ -101,6 +101,20 @@ void requantize_i32_to_i8(
     int8_t *output,
     int count,
     float scale,
+    int8_t zero_point);
+
+/**
+ * Requantize with per-channel scale and bias (for ternary layers with BN).
+ * For each spatial position x and channel c:
+ *   out[x*C+c] = clamp(round((in[x*C+c] + bias[c]) * scale[c]) + zp, -128, 127)
+ */
+void requantize_i32_to_i8_per_channel(
+    const int32_t *input,
+    int8_t *output,
+    int width,
+    int channels,
+    const float *scale,
+    const int32_t *bias,
     int8_t zero_point);
 
 /** ReLU in-place on INT8 activations. */

@@ -18,6 +18,74 @@ from train_baseline import MobileNetV1, get_loaders
 
 
 # ---------------------------------------------------------------------------
+# Fake INT8 quantization for QAT
+# ---------------------------------------------------------------------------
+
+class FakeQuantizeFunction(torch.autograd.Function):
+    """Simulate INT8 quantization: quantize then dequantize, STE backward."""
+
+    @staticmethod
+    def forward(ctx, x):
+        # Per-tensor quantize-dequantize to match firmware requant behavior
+        absmax = x.abs().max().clamp(min=1e-8)
+        scale = absmax / 127.0
+        x_q = torch.clamp(torch.round(x / scale), -128, 127)
+        return x_q * scale
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output  # STE: pass gradient through unchanged
+
+
+class FakeQuantize(nn.Module):
+    """Module wrapper for fake INT8 quantization (inserted after ReLU)."""
+
+    def __init__(self):
+        super().__init__()
+        self.enabled = False
+
+    def forward(self, x):
+        if self.enabled and self.training:
+            return FakeQuantizeFunction.apply(x)
+        return x
+
+
+def apply_fake_quantize(model):
+    """Insert FakeQuantize after every ReLU in the model for QAT."""
+    # Replace ReLU(inplace=True) with ReLU(inplace=False) + FakeQuantize
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Sequential):
+            new_children = []
+            for child in module:
+                new_children.append(child)
+                if isinstance(child, nn.ReLU):
+                    child.inplace = False  # Can't use inplace with FakeQuantize
+                    new_children.append(FakeQuantize())
+            if len(new_children) != len(list(module)):
+                # Rebuild sequential with FakeQuantize inserted
+                for i, child in enumerate(new_children):
+                    if i < len(module):
+                        module[i] = child  # This won't work for extending
+                # Use a different approach: replace the sequential
+                parent_name = ".".join(name.split(".")[:-1]) if "." in name else ""
+                attr_name = name.split(".")[-1]
+                if parent_name:
+                    parent = model
+                    for p in parent_name.split("."):
+                        parent = parent[int(p)] if p.isdigit() else getattr(parent, p)
+                else:
+                    parent = model
+                setattr(parent, attr_name, nn.Sequential(*new_children))
+
+
+def set_fake_quantize_enabled(model, enabled):
+    """Enable/disable all FakeQuantize modules in the model."""
+    for m in model.modules():
+        if isinstance(m, FakeQuantize):
+            m.enabled = enabled
+
+
+# ---------------------------------------------------------------------------
 # Ternary quantization core
 # ---------------------------------------------------------------------------
 
@@ -247,8 +315,21 @@ def validate(model, loader, criterion, device):
 
 def train_ternary(model, train_loader, val_loader, device, hparams):
     """Three-phase TTQ training."""
-    quant_config = get_default_quant_config(model)
+    # Load pre-trained baseline weights if provided
+    baseline_weights = hparams.get("baseline_weights")
+    if baseline_weights and Path(baseline_weights).exists():
+        model.load_state_dict(
+            torch.load(baseline_weights, weights_only=True, map_location="cpu")
+        )
+        model = model.to(device)
+        print(f"Loaded baseline weights from {baseline_weights}")
+
+    quant_config = hparams.get("quant_config", get_default_quant_config(model))
     apply_ttq(model, quant_config, hparams.get("threshold_ratio", 0.05))
+
+    # Insert fake INT8 quantization after each ReLU for QAT
+    apply_fake_quantize(model)
+    set_fake_quantize_enabled(model, False)  # Disabled during warmup
 
     # Separate param groups: scales get lower LR
     scale_params = []
@@ -280,11 +361,12 @@ def train_ternary(model, train_loader, val_loader, device, hparams):
             set_ttq_enabled(model, False)
 
         if epoch == hparams["epochs_warmup"] + 1:
-            print("Phase 2: TTQ with STE")
+            print("Phase 2: TTQ + QAT (fake INT8 quantization)")
             set_ttq_enabled(model, True)
+            set_fake_quantize_enabled(model, True)
 
         if epoch == hparams["epochs_warmup"] + hparams["epochs_ttq"] + 1:
-            print("Phase 3: Frozen ternary fine-tune")
+            print("Phase 3: Frozen ternary fine-tune (QAT still active)")
             freeze_ternary(model)
 
         train_loss, train_acc = train_one_epoch(

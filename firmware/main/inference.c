@@ -86,8 +86,17 @@ int classify_image(const int8_t *input_96x96x3)
     memcpy(in, input_96x96x3, INPUT_H * INPUT_W * INPUT_C);
 
     int cur_h = INPUT_H, cur_w = INPUT_W;
+    static int dbg = 0;
 
     for (int i = 0; i < NUM_LAYERS; i++) {
+        if (dbg == 0) {
+            const layer_config_t *Ld = &model_layers[i];
+            int sz = (i == 0) ? 8 : 8;
+            printf("DBG L%d pre[0:%d]: ", i, sz);
+            for (int d = 0; d < sz; d++) printf("%d ", in[d]);
+            printf(" rq_perch=%p rq=%.6f\n",
+                   (void*)Ld->requant_scale_per_ch, Ld->requant_scale);
+        }
         const layer_config_t *L = &model_layers[i];
 
         switch (L->type) {
@@ -105,16 +114,20 @@ int classify_image(const int8_t *input_96x96x3)
                         cur_h, cur_w, L->in_c,
                         L->out_c, L->kernel,
                         L->stride, L->padding, y, 1);
+                    requantize_i32_to_i8_per_channel(
+                        acc_row, &out[y * row_elems], w_out, L->out_c,
+                        L->requant_scale_per_ch, L->bias, L->requant_zp);
                 } else {
                     int8_conv2d(
                         in, (const int8_t *)L->weights, L->bias, acc_row,
                         cur_h, cur_w, L->in_c,
                         L->out_c, L->kernel,
                         L->stride, L->padding, y, 1);
+                    /* INT8: bias already added by kernel, use per-ch requant w/o bias */
+                    requantize_i32_to_i8_per_channel(
+                        acc_row, &out[y * row_elems], w_out, L->out_c,
+                        L->requant_scale_per_ch, NULL, L->requant_zp);
                 }
-
-                requantize_i32_to_i8(acc_row, &out[y * row_elems], row_elems,
-                                     L->requant_scale, L->requant_zp);
                 relu_i8(&out[y * row_elems], row_elems);
             }
 
@@ -136,15 +149,18 @@ int classify_image(const int8_t *input_96x96x3)
                         cur_h, cur_w, L->in_c,
                         L->out_c, L->kernel,
                         L->stride, L->padding, y, 1);
+                    requantize_i32_to_i8_per_channel(
+                        acc_row, &out[y * row_elems], w_out, L->out_c,
+                        L->requant_scale_per_ch, L->bias, L->requant_zp);
                 } else {
                     int8_depthwise_conv2d(
                         in, (const int8_t *)L->weights, L->bias, acc_row,
                         cur_h, cur_w, L->in_c,
                         L->kernel, L->stride, L->padding, y, 1);
+                    requantize_i32_to_i8_per_channel(
+                        acc_row, &out[y * row_elems], w_out, L->out_c,
+                        L->requant_scale_per_ch, NULL, L->requant_zp);
                 }
-
-                requantize_i32_to_i8(acc_row, &out[y * row_elems], row_elems,
-                                     L->requant_scale, L->requant_zp);
                 relu_i8(&out[y * row_elems], row_elems);
             }
 
@@ -162,14 +178,17 @@ int classify_image(const int8_t *input_96x96x3)
                     in, (const uint8_t *)L->weights, acc_row,
                     L->scale_pos, L->scale_neg,
                     n_in, n_out);
+                requantize_i32_to_i8_per_channel(
+                    acc_row, out, 1, n_out,
+                    L->requant_scale_per_ch, L->bias, L->requant_zp);
             } else {
                 int8_dense(
                     in, (const int8_t *)L->weights, L->bias, acc_row,
                     n_in, n_out);
+                requantize_i32_to_i8_per_channel(
+                    acc_row, out, 1, n_out,
+                    L->requant_scale_per_ch, NULL, L->requant_zp);
             }
-
-            requantize_i32_to_i8(acc_row, out, n_out,
-                                 L->requant_scale, L->requant_zp);
             cur_h = 1;
             cur_w = 1;
             break;
@@ -187,7 +206,15 @@ int classify_image(const int8_t *input_96x96x3)
         int8_t *tmp = in;
         in = out;
         out = tmp;
+
+        if (dbg == 0) {
+            printf("DBG L%d post[0:8]: ", i);
+            for (int d = 0; d < 8; d++) printf("%d ", in[d]);
+            printf("\n");
+        }
     }
+    printf("DBG final: [%d, %d] -> %s\n", in[0], in[1],
+           (in[0] > in[1]) ? "CAT" : "DOG");
 
     return (in[0] > in[1]) ? CLASS_CAT : CLASS_DOG;
 }
