@@ -22,17 +22,17 @@ from train_baseline import MobileNetV1, get_loaders
 # ---------------------------------------------------------------------------
 
 class FakeQuantizeFunction(torch.autograd.Function):
-    """Simulate per-channel INT8 quantization matching deployment requant."""
+    """Simulate per-tensor INT8 quantization matching deployment requant.
+
+    Uses per-tensor scaling (single scale for all channels) to match the
+    firmware's per-tensor activation quantization. This ensures QAT training
+    produces a model robust to the actual deployment quantization scheme.
+    """
 
     @staticmethod
     def forward(ctx, x):
-        # Per-channel quantize-dequantize on channel dim (dim=1 for NCHW)
-        if x.dim() == 4:  # [N, C, H, W]
-            absmax = x.abs().amax(dim=(0, 2, 3), keepdim=True).clamp(min=1e-8)
-        elif x.dim() == 2:  # [N, C] for classifier
-            absmax = x.abs().amax(dim=0, keepdim=True).clamp(min=1e-8)
-        else:
-            absmax = x.abs().max().clamp(min=1e-8)
+        # Per-tensor quantize-dequantize (single scale for all channels)
+        absmax = x.abs().max().clamp(min=1e-8)
         scale = absmax / 127.0
         x_q = torch.clamp(torch.round(x / scale), -128, 127)
         return x_q * scale
@@ -55,15 +55,9 @@ class FakeQuantize(nn.Module):
     def forward(self, x):
         if self.enabled:
             result = FakeQuantizeFunction.apply(x)
-            # Update running absmax for export
+            # Track running per-tensor absmax for export
             with torch.no_grad():
-                if x.dim() == 4:
-                    absmax = x.abs().amax(dim=(0, 2, 3))
-                elif x.dim() == 2:
-                    absmax = x.abs().amax(dim=0)
-                else:
-                    absmax = x.abs().max().unsqueeze(0)
-
+                absmax = x.abs().max().unsqueeze(0)
                 if self.running_absmax is None or self.running_absmax.shape != absmax.shape:
                     self.running_absmax = absmax.clone()
                 else:
@@ -267,14 +261,18 @@ def apply_ttq(model, quant_config, threshold_ratio=0.05):
 
 
 def get_default_quant_config(model):
-    """Default mixed-precision config: first conv + classifier INT8, middle ternary."""
+    """Mixed-precision: first conv + classifier + depthwise + small pointwise INT8, large pointwise ternary."""
     config = {}
     for name, mod in model.named_modules():
         if isinstance(mod, nn.Conv2d):
             if name == "first_conv.0":
                 config[name] = "int8"
+            elif mod.groups == mod.in_channels and mod.groups > 1:
+                config[name] = "int8"  # depthwise
+            elif mod.in_channels >= 128:
+                config[name] = "ternary"  # large pointwise only
             else:
-                config[name] = "ternary"
+                config[name] = "int8"  # small pointwise: precision > compression
         elif isinstance(mod, nn.Linear):
             config[name] = "int8"
     return config
@@ -375,6 +373,7 @@ def train_ternary(model, train_loader, val_loader, device, hparams):
     best_acc = 0.0
     save_dir = Path(hparams.get("save_dir", "checkpoints"))
     save_dir.mkdir(parents=True, exist_ok=True)
+    ttq_active = False
 
     for epoch in range(1, total_epochs + 1):
         # Phase transitions
@@ -386,6 +385,8 @@ def train_ternary(model, train_loader, val_loader, device, hparams):
             print("Phase 2: TTQ + QAT (fake INT8 quantization)")
             set_ttq_enabled(model, True)
             set_fake_quantize_enabled(model, True)
+            ttq_active = True
+            best_acc = 0.0  # Reset: warmup accuracy isn't comparable
 
         if epoch == hparams["epochs_warmup"] + hparams["epochs_ttq"] + 1:
             print("Phase 3: Frozen ternary fine-tune (QAT still active)")
@@ -404,13 +405,15 @@ def train_ternary(model, train_loader, val_loader, device, hparams):
         if epoch % 10 == 0:
             print_ternary_stats(model)
 
-        if val_acc > best_acc:
+        # Only save best from TTQ/freeze phases (warmup weights are not ternary-trained)
+        if ttq_active and val_acc > best_acc:
             best_acc = val_acc
             torch.save(model.state_dict(), save_dir / "best_ternary.pt")
 
     print(f"Best ternary val accuracy: {best_acc:.4f}")
     model.load_state_dict(
-        torch.load(save_dir / "best_ternary.pt", weights_only=True)
+        torch.load(save_dir / "best_ternary.pt", weights_only=True),
+        strict=False  # FakeQuantize running_absmax may be None in checkpoint
     )
     return model
 
