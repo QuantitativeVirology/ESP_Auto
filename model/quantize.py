@@ -66,23 +66,37 @@ class FakeQuantize(nn.Module):
         return x
 
 
-def apply_fake_quantize(model):
-    """Insert FakeQuantize after every ReLU in the model for QAT."""
-    # Replace ReLU(inplace=True) with ReLU(inplace=False) + FakeQuantize
+class PACTReLU(nn.Module):
+    """Learned activation clamp: clamp(x, 0, |alpha|).
+
+    Replaces ReLU during QAT to bound per-layer activation range,
+    reducing per-tensor quantization waste. Alpha is learned.
+    """
+
+    def __init__(self, init_alpha=6.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, x):
+        return torch.clamp(x, min=0.0, max=self.alpha.abs())
+
+
+def apply_fake_quantize(model, use_pact=False):
+    """Insert FakeQuantize (and optionally PACTReLU) after every ReLU in the model for QAT."""
     for name, module in model.named_modules():
         if isinstance(module, nn.Sequential):
             new_children = []
             for child in module:
-                new_children.append(child)
                 if isinstance(child, nn.ReLU):
-                    child.inplace = False  # Can't use inplace with FakeQuantize
+                    child.inplace = False
+                    if use_pact:
+                        new_children.append(PACTReLU(init_alpha=6.0))
+                    else:
+                        new_children.append(child)
                     new_children.append(FakeQuantize())
+                else:
+                    new_children.append(child)
             if len(new_children) != len(list(module)):
-                # Rebuild sequential with FakeQuantize inserted
-                for i, child in enumerate(new_children):
-                    if i < len(module):
-                        module[i] = child  # This won't work for extending
-                # Use a different approach: replace the sequential
                 parent_name = ".".join(name.split(".")[:-1]) if "." in name else ""
                 attr_name = name.split(".")[-1]
                 if parent_name:
@@ -348,14 +362,14 @@ def train_ternary(model, train_loader, val_loader, device, hparams):
     apply_ttq(model, quant_config, hparams.get("threshold_ratio", 0.05))
 
     # Insert fake INT8 quantization after each ReLU for QAT
-    apply_fake_quantize(model)
+    apply_fake_quantize(model, use_pact=hparams.get("use_pact", False))
     set_fake_quantize_enabled(model, False)  # Disabled during warmup
 
     # Separate param groups: scales get lower LR
     scale_params = []
     other_params = []
     for name, p in model.named_parameters():
-        if "scale_" in name:
+        if "scale_" in name or "alpha" in name:
             scale_params.append(p)
         else:
             other_params.append(p)
@@ -437,6 +451,8 @@ def main():
     parser.add_argument("--epochs-ttq", type=int, default=70)
     parser.add_argument("--epochs-freeze", type=int, default=20)
     parser.add_argument("--threshold-ratio", type=float, default=0.05)
+    parser.add_argument("--pact", action="store_true",
+                        help="Use PACT learned activation clamps during QAT")
     parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
 
@@ -466,6 +482,7 @@ def main():
         "epochs_ttq": args.epochs_ttq,
         "epochs_freeze": args.epochs_freeze,
         "threshold_ratio": args.threshold_ratio,
+        "use_pact": args.pact,
         "save_dir": args.save_dir,
     }
 
