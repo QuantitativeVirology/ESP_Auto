@@ -78,7 +78,7 @@ class PACTReLU(nn.Module):
         self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
 
     def forward(self, x):
-        return torch.clamp(x, min=0.0, max=self.alpha.abs())
+        return torch.min(F.relu(x), self.alpha.abs())
 
 
 def apply_fake_quantize(model, use_pact=False):
