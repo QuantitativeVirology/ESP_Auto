@@ -17,7 +17,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "model"))
 
-TIMEOUT_SECONDS = 3600  # 1 hour — training can take 35+ min
+TIMEOUT_SECONDS = 7200  # 2 hours — training ~80 min on MPS
 CACHE_DIR = PROJECT_ROOT / "model" / ".cache"
 # Try /tmp first (avoids iCloud Drive I/O hangs), fall back to in-repo
 DATA_DIR = Path("/tmp/esp_datasets") if Path("/tmp/esp_datasets").exists() else PROJECT_ROOT / "model" / "datasets"
