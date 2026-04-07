@@ -16,7 +16,7 @@ from train_baseline import MobileNetV1, DepthwiseSeparableConv
 
 def build_model():
     """Return an untrained model. The LLM agent modifies this."""
-    return MobileNetV1(alpha=0.35, num_classes=2)
+    return MobileNetV1(alpha=0.25, num_classes=2)
 
 
 def get_quant_config():
@@ -25,10 +25,14 @@ def get_quant_config():
     Keys are module names from model.named_modules().
     Values: "ternary" or "int8".
     First conv and classifier MUST be "int8".
+
+    B-light strategy: early pointwise (in_c < 128) stays INT8 for precision,
+    deep pointwise (in_c >= 128) uses ternary for compression.
+    All depthwise layers stay INT8.
     """
     return {
         "first_conv.0": "int8",
-        # Depthwise layers: INT8 (few params, high quantization sensitivity)
+        # Depthwise layers: always INT8
         "features.0.dw.0": "int8",
         "features.1.dw.0": "int8",
         "features.2.dw.0": "int8",
@@ -42,13 +46,14 @@ def get_quant_config():
         "features.10.dw.0": "int8",
         "features.11.dw.0": "int8",
         "features.12.dw.0": "int8",
-        # Pointwise layers: ternary (many params, benefit from compression)
-        "features.0.pw.0": "ternary",
-        "features.1.pw.0": "ternary",
-        "features.2.pw.0": "ternary",
-        "features.3.pw.0": "ternary",
-        "features.4.pw.0": "ternary",
-        "features.5.pw.0": "ternary",
+        # Early pointwise: INT8 (few params, precision matters)
+        "features.0.pw.0": "int8",
+        "features.1.pw.0": "int8",
+        "features.2.pw.0": "int8",
+        "features.3.pw.0": "int8",
+        "features.4.pw.0": "int8",
+        "features.5.pw.0": "int8",
+        # Deep pointwise: ternary (many params, compression benefit)
         "features.6.pw.0": "ternary",
         "features.7.pw.0": "ternary",
         "features.8.pw.0": "ternary",
@@ -64,11 +69,11 @@ def get_quant_config():
 def get_hparams():
     """Training hyperparameters."""
     return {
-        "lr": 1e-3,
+        "lr": 5e-4,
         "wd": 1e-4,
-        "epochs_warmup": 30,
+        "epochs_warmup": 15,
         "epochs_ttq": 50,
-        "epochs_freeze": 20,
+        "epochs_freeze": 15,
         "batch_size": 64,
         "threshold_ratio": 0.05,
         "quant_config": get_quant_config(),
