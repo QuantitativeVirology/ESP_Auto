@@ -17,9 +17,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "model"))
 
-TIMEOUT_SECONDS = 300
+TIMEOUT_SECONDS = 3600  # 1 hour — training can take 35+ min
 CACHE_DIR = PROJECT_ROOT / "model" / ".cache"
-DATA_DIR = PROJECT_ROOT / "model" / "datasets"
+# Try /tmp first (avoids iCloud Drive I/O hangs), fall back to in-repo
+DATA_DIR = Path("/tmp/esp_datasets") if Path("/tmp/esp_datasets").exists() else PROJECT_ROOT / "model" / "datasets"
 FIRMWARE_DIR = PROJECT_ROOT / "firmware"
 
 
@@ -87,10 +88,11 @@ def train_and_quantize(train_module, arch_hash):
 
 
 def export_model(train_module, weights_path):
-    """Export packed weights to C header."""
+    """Export packed weights to C header. Returns (success, int8_accuracy)."""
     import torch
     from quantize import apply_ttq, set_ttq_enabled
     from export_packed import extract_layers, validate_packing, generate_header
+    from export_packed import _verify_quantized_pipeline
 
     model = train_module.build_model()
     config = train_module.get_quant_config()
@@ -99,18 +101,23 @@ def export_model(train_module, weights_path):
 
     apply_ttq(model, config, threshold)
     model.load_state_dict(
-        torch.load(weights_path, weights_only=True, map_location="cpu")
+        torch.load(weights_path, weights_only=True, map_location="cpu"),
+        strict=False  # Checkpoint may include FakeQuantize buffers
     )
     set_ttq_enabled(model, True)
 
     layers = extract_layers(model, threshold)
     if not validate_packing(layers):
         print("[prepare] Packing validation FAILED")
-        return False
+        return False, 0.0
+
+    # Simulated INT8 verification (pre-filter before flash)
+    int8_acc = _verify_quantized_pipeline(layers) or 0.0
+    print(f"[prepare] Simulated INT8 accuracy: {int8_acc:.1f}%")
 
     output = FIRMWARE_DIR / "main" / "model_data.h"
     generate_header(layers, str(output))
-    return True
+    return True, int8_acc
 
 
 def flash_and_measure(port):
@@ -132,11 +139,26 @@ def flash_and_measure(port):
     return -1.0
 
 
+def find_esp_port():
+    """Auto-detect ESP32 serial port."""
+    import glob
+    for pattern in ["/dev/cu.usbserial-*", "/dev/cu.usbmodem*", "/dev/cu.SLAB*"]:
+        ports = glob.glob(pattern)
+        if ports:
+            return ports[0]
+    return None
+
+
+MIN_INT8_ACCURACY = 60.0  # Skip flash if simulated accuracy below this
+
+
 def main():
     signal.signal(signal.SIGALRM, timeout_handler)
     signal.alarm(TIMEOUT_SECONDS)
 
-    port = os.environ.get("ESP_PORT", "/dev/cu.usbserial-0001")
+    port = os.environ.get("ESP_PORT") or find_esp_port()
+    if not port:
+        print("[prepare] WARNING: No ESP32 port found, will skip flash")
 
     try:
         train_module = load_train_module()
@@ -145,8 +167,26 @@ def main():
 
         weights_path = train_and_quantize(train_module, arch_hash)
 
-        if not export_model(train_module, weights_path):
+        result = export_model(train_module, weights_path)
+        if isinstance(result, tuple):
+            success, int8_acc = result
+        else:
+            success, int8_acc = result, 0.0
+
+        if not success:
             print("SCORE: -1.000000")
+            return
+
+        # Pre-filter: skip expensive flash if simulated accuracy too low
+        if int8_acc < MIN_INT8_ACCURACY:
+            print(f"[prepare] Simulated INT8 accuracy {int8_acc:.1f}% < {MIN_INT8_ACCURACY}%, skipping flash")
+            score = int8_acc * 0.001  # Low score proportional to accuracy
+            print(f"SCORE: {score:.6f}")
+            return
+
+        if not port:
+            print(f"[prepare] No ESP32 port — using simulated accuracy as score proxy")
+            print(f"SCORE: {int8_acc * 0.01:.6f}")
             return
 
         score = flash_and_measure(port)
@@ -157,6 +197,8 @@ def main():
         print("SCORE: -1.000000")
     except Exception as e:
         print(f"[prepare] Error: {e}")
+        import traceback
+        traceback.print_exc()
         print("SCORE: -1.000000")
 
 

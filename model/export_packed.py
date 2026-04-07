@@ -394,7 +394,9 @@ def _verify_quantized_pipeline(layers, data_dir=None):
             pred_str = "CAT" if pred == 0 else "DOG"
             print(f"  Image {img_idx} [{label_str}]: logits=[{logits[0]}, {logits[1]}] -> {pred_str} {'OK' if pred == cal_labels[img_idx] else 'WRONG'}")
 
-    print(f"  Verification accuracy: {correct}/{n_verify} = {100*correct/n_verify:.1f}%")
+    acc_pct = 100*correct/n_verify
+    print(f"  Verification accuracy: {correct}/{n_verify} = {acc_pct:.1f}%")
+    return acc_pct
 
 
 def _calibrate_requant(layers, n_passes=2, data_dir=None):
