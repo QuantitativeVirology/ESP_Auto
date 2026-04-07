@@ -18,10 +18,10 @@ Autonomous optimization loop (Karpathy's autoresearch pattern) for ternary-weigh
 ## ESP-IDF Setup
 
 ```bash
-source /Users/jensbosse/Documents/Cowork/ESP_webclock_temp_humidity/esp-idf/export.sh
+source /Users/bosselab/Projects/esp-idf/export.sh
 ```
 
-**iCloud Drive workaround:** This repo is on iCloud Drive which can cause I/O hangs. The venv lives at `/tmp/esp_auto_venv2`, datasets at `/tmp/esp_datasets`, and firmware may be copied to `/tmp/esp_firmware` for builds.
+**Local paths:** Project lives at `/Users/bosselab/Projects/ESP_Auto` (off iCloud). Datasets at `/tmp/esp_datasets` (symlinked from `model/datasets`). Venv at `/tmp/esp_auto_venv3`.
 
 ## Build & Flash
 
@@ -35,7 +35,7 @@ idf.py -p /dev/cu.usbserial-* flash monitor
 ## Python Environment
 
 ```bash
-source /tmp/esp_auto_venv2/bin/activate    # or source .venv/bin/activate
+source /tmp/esp_auto_venv3/bin/activate
 python model/train_baseline.py --export-test-images  # train INT8 baseline + generate test_images.h
 python model/quantize.py                              # TTQ quantization (loads baseline weights)
 python model/export_packed.py                         # export model_data.h for firmware
