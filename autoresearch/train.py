@@ -77,4 +77,5 @@ def get_hparams():
         "batch_size": 64,
         "threshold_ratio": 0.05,
         "quant_config": get_quant_config(),
+        "baseline_weights": "checkpoints/best_model.pt",
     }
