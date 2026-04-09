@@ -3,6 +3,8 @@
 
 THIS FILE IS EDITED BY THE LLM AGENT during autoresearch optimization.
 It must expose three functions: build_model(), get_quant_config(), get_hparams().
+
+Current config: alpha=0.35, all-INT8 (no ternary). Targeting 90%+ on-device accuracy.
 """
 
 import sys
@@ -15,53 +17,40 @@ from train_baseline import MobileNetV1, DepthwiseSeparableConv
 
 
 def build_model():
-    """Return an untrained model. The LLM agent modifies this."""
-    return MobileNetV1(alpha=0.25, num_classes=2)
+    """Return an untrained model."""
+    return MobileNetV1(alpha=0.35, num_classes=2)
 
 
 def get_quant_config():
-    """Per-layer quantization mode.
-
-    Keys are module names from model.named_modules().
-    Values: "ternary" or "int8".
-    First conv and classifier MUST be "int8".
-
-    B-light strategy: early pointwise (in_c < 128) stays INT8 for precision,
-    deep pointwise (in_c >= 128) uses ternary for compression.
-    All depthwise layers stay INT8.
-    """
+    """All-INT8 quantization — maximum precision, fits in 512KB flash (398KB weights)."""
     return {
         "first_conv.0": "int8",
-        # Depthwise layers: always INT8
         "features.0.dw.0": "int8",
-        "features.1.dw.0": "int8",
-        "features.2.dw.0": "int8",
-        "features.3.dw.0": "int8",
-        "features.4.dw.0": "int8",
-        "features.5.dw.0": "int8",
-        "features.6.dw.0": "int8",
-        "features.7.dw.0": "int8",
-        "features.8.dw.0": "int8",
-        "features.9.dw.0": "int8",
-        "features.10.dw.0": "int8",
-        "features.11.dw.0": "int8",
-        "features.12.dw.0": "int8",
-        # Early pointwise: INT8 (few params, precision matters)
         "features.0.pw.0": "int8",
+        "features.1.dw.0": "int8",
         "features.1.pw.0": "int8",
+        "features.2.dw.0": "int8",
         "features.2.pw.0": "int8",
+        "features.3.dw.0": "int8",
         "features.3.pw.0": "int8",
+        "features.4.dw.0": "int8",
         "features.4.pw.0": "int8",
+        "features.5.dw.0": "int8",
         "features.5.pw.0": "int8",
-        # Deep pointwise: ternary (many params, compression benefit)
-        "features.6.pw.0": "ternary",
-        "features.7.pw.0": "ternary",
-        "features.8.pw.0": "ternary",
-        "features.9.pw.0": "ternary",
-        "features.10.pw.0": "ternary",
-        "features.11.pw.0": "ternary",
-        "features.12.pw.0": "ternary",
-        # Classifier: INT8
+        "features.6.dw.0": "int8",
+        "features.6.pw.0": "int8",
+        "features.7.dw.0": "int8",
+        "features.7.pw.0": "int8",
+        "features.8.dw.0": "int8",
+        "features.8.pw.0": "int8",
+        "features.9.dw.0": "int8",
+        "features.9.pw.0": "int8",
+        "features.10.dw.0": "int8",
+        "features.10.pw.0": "int8",
+        "features.11.dw.0": "int8",
+        "features.11.pw.0": "int8",
+        "features.12.dw.0": "int8",
+        "features.12.pw.0": "int8",
         "classifier": "int8",
     }
 
@@ -77,5 +66,5 @@ def get_hparams():
         "batch_size": 64,
         "threshold_ratio": 0.05,
         "quant_config": get_quant_config(),
-        "baseline_weights": "checkpoints/best_model.pt",
+        "baseline_weights": "checkpoints/alpha035/best_model.pt",
     }
