@@ -525,12 +525,32 @@ def _calibrate_requant(layers, n_passes=2, data_dir=None):
         print(f"  Pass {pass_idx+1}: calibrated {len([L for L in layers if 'requant_per_ch' in L])} layers")
 
 
+def _compute_s_out(float_range, percentile=99.5):
+    """Compute per-tensor output scale from per-channel float activation ranges.
+
+    Uses a percentile instead of max to avoid letting outlier channels waste
+    the INT8 dynamic range. Channels above the percentile get clipped to 127
+    (saturated) but the majority of channels get better precision.
+    """
+    if float_range is None:
+        return None
+    fr = float_range
+    if len(fr) <= 2:
+        # Classifier or very few channels — use max
+        return fr.max() / 127.0
+    pct_val = np.percentile(fr, percentile)
+    # Don't let percentile be less than 50% of max (avoid extreme clipping)
+    pct_val = max(pct_val, fr.max() * 0.5)
+    return max(pct_val / 127.0, 1e-10)
+
+
 def extract_layers(model, threshold_ratio=0.05):
     """Walk model and extract layer configs with packed weights.
 
     Uses analytical requant and bias from float activation ranges (per-tensor
-    output scaling, matching TFLite-style quantization). This ensures correct
-    scale propagation through the layer chain.
+    output scaling with percentile clipping). This ensures correct
+    scale propagation through the layer chain while giving weak channels
+    more effective INT8 bits.
     """
     layers = []
 
@@ -563,7 +583,7 @@ def extract_layers(model, threshold_ratio=0.05):
     # Output scale from float activation range (per-tensor: max over all channels)
     n_out = first_conv.out_channels
     fr = float_ranges.get('first_conv')
-    s_out = fr.max() / 127.0 if fr is not None else s_in * float(w_scale_per_ch.max())
+    s_out = _compute_s_out(fr) or (s_in * float(w_scale_per_ch.max()))
     s_out = max(s_out, 1e-10)
 
     # Analytical requant: requant[c] = (s_in * w_scale[c]) / s_out
@@ -602,7 +622,7 @@ def extract_layers(model, threshold_ratio=0.05):
 
             range_key = f'features_{blk_idx}_{sub_name}'
             fr = float_ranges.get(range_key)
-            s_out = fr.max() / 127.0 if fr is not None else s_in
+            s_out = _compute_s_out(fr) or s_in
             s_out = max(s_out, 1e-10)
 
             if isinstance(conv, TernaryQuantWrapper):
@@ -700,12 +720,9 @@ def extract_layers(model, threshold_ratio=0.05):
     float_bias_cls = classifier.bias.data.cpu().numpy()
     bias_i32 = np.round(float_bias_cls / safe_acc_scale).astype(np.int32)
 
-    # Classifier requant from float output range
+    # Classifier requant from float output range (use max for classifier — only 2 outputs)
     fr = float_ranges.get('classifier')
-    if fr is not None:
-        s_out_cls = max(fr.max() / 127.0, 1e-10)
-    else:
-        s_out_cls = max(s_in * float(w_scale_per_ch.max()) * classifier.in_features / 127.0, 1e-10)
+    s_out_cls = _compute_s_out(fr) or max(s_in * float(w_scale_per_ch.max()) * classifier.in_features / 127.0, 1e-10)
 
     n_cls = classifier.out_features
     requant_per_ch = (acc_scale / s_out_cls).astype(np.float32)
