@@ -382,7 +382,15 @@ def train_ternary(model, train_loader, val_loader, device, hparams):
     total_epochs = (hparams["epochs_warmup"] + hparams["epochs_ttq"]
                     + hparams["epochs_freeze"])
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
-    criterion = nn.CrossEntropyLoss()
+
+    # Class-balanced loss (Oxford Pets has ~2x more dogs than cats)
+    cat_count = sum(1 for _, l in train_loader.dataset if l == 0)
+    dog_count = len(train_loader.dataset) - cat_count
+    if cat_count > 0 and dog_count > 0:
+        weight = torch.tensor([dog_count / cat_count, 1.0]).to(device)
+    else:
+        weight = None
+    criterion = nn.CrossEntropyLoss(weight=weight)
 
     best_acc = 0.0
     save_dir = Path(hparams.get("save_dir", "checkpoints"))
