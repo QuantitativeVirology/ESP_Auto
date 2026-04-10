@@ -120,5 +120,18 @@ void requantize_i32_to_i8_per_channel(
 /** ReLU in-place on INT8 activations. */
 void relu_i8(int8_t *data, int count);
 
+/**
+ * Per-channel rescale of INT8 activations (in-place).
+ * Amplifies weak channels to use more of the INT8 range.
+ * For each spatial position x and channel c:
+ *   data[x*C+c] = clamp(round(data[x*C+c] * scale[c]), -128, 127)
+ * Applied after conv+requant+relu, before the next layer.
+ */
+void rescale_i8_per_channel(
+    int8_t *data,
+    int width, int height,
+    int channels,
+    const float *scale);
+
 /** Run kernel correctness tests (SIMD vs C reference). Returns number of failures. */
 int run_kernel_tests(void);

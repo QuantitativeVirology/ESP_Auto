@@ -21,7 +21,8 @@ typedef struct {
     float scale_pos;
     float scale_neg;
     float requant_scale;
-    const float *requant_scale_per_ch;  // per-channel requant for ternary (NULL for INT8)
+    const float *requant_scale_per_ch;  // per-channel requant
+    const float *rescale_per_ch;        // per-channel activation rescale (NULL = skip)
     int8_t requant_zp;
     int in_c, out_c;
     int kernel, stride, padding;

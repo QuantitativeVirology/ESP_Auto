@@ -386,6 +386,15 @@ def _verify_quantized_pipeline(layers, data_dir=None):
                 out_i8 = np.maximum(out_i8, np.int8(0))
 
             act = out_i8.reshape(h_out, w_out, L['out_c'])
+
+            # Apply per-channel rescale (amplify weak channels)
+            if L.get('rescale_per_ch') is not None:
+                rs = L['rescale_per_ch']
+                for oc in range(act.shape[2]):
+                    fval = act[:, :, oc].astype(np.float64) * rs[oc]
+                    ival = np.where(fval >= 0, np.floor(fval + 0.5), np.ceil(fval - 0.5))
+                    act[:, :, oc] = np.clip(ival, -128, 127).astype(np.int8)
+
             cur_h, cur_w = h_out, w_out
 
         logits = act.flatten()[:2]
@@ -593,6 +602,15 @@ def extract_layers(model, threshold_ratio=0.05):
     requant_per_ch = (acc_scale / s_out).astype(np.float32)
     requant_per_ch = np.clip(requant_per_ch, 1e-6, 10.0)
 
+    # Compute rescale for first_conv (feeds into DW layer)
+    first_rescale = None
+    if fr is not None and len(fr) > 2:
+        max_fr = fr.max()
+        safe_fr = np.where(fr > max_fr * 0.01, fr, max_fr)
+        first_rescale = (max_fr / safe_fr).astype(np.float32)
+        if first_rescale.max() / first_rescale.min() <= 1.2:
+            first_rescale = None
+
     layers.append({
         "name": "first_conv",
         "type": "LAYER_CONV2D",
@@ -601,6 +619,7 @@ def extract_layers(model, threshold_ratio=0.05):
         "weight_scale": float(w_scale_per_ch.max()),
         "bias": bias_i32,
         "requant_per_ch": requant_per_ch,
+        "rescale_per_ch": first_rescale,
         "in_c": 3, "out_c": n_out,
         "kernel": first_conv.kernel_size[0],
         "stride": first_conv.stride[0],
@@ -610,6 +629,7 @@ def extract_layers(model, threshold_ratio=0.05):
     })
     print(f"  first_conv: s_in={s_in:.6f} s_out={s_out:.6f} requant=[{requant_per_ch.min():.4f}, {requant_per_ch.max():.4f}]")
     s_in = s_out  # update for next layer
+    prev_rescale = first_rescale  # track rescale for DW correction
 
     # --- Depthwise-separable blocks ---
     for blk_idx, block in enumerate(model.features):
@@ -640,7 +660,11 @@ def extract_layers(model, threshold_ratio=0.05):
                 # → bias = bn_folded_bias / (bn_s * s_in * avg_s)
                 # → requant[c] = bn_s[c] * s_in * avg_s / s_out
                 bn_s_np = bn_s.cpu().numpy()
-                acc_scale_per_ch = bn_s_np * avg_s * s_in
+                if is_depthwise and prev_rescale is not None:
+                    s_in_per_ch = s_in / prev_rescale
+                    acc_scale_per_ch = bn_s_np * avg_s * s_in_per_ch
+                else:
+                    acc_scale_per_ch = bn_s_np * avg_s * s_in
                 safe_acc_s = np.where(np.abs(acc_scale_per_ch) < 1e-10, 1e-10, acc_scale_per_ch)
                 bias_i32 = np.round(bn_bias_val.cpu().numpy() / safe_acc_s).astype(np.int32)
                 n_oc = conv.module.out_channels
@@ -674,8 +698,13 @@ def extract_layers(model, threshold_ratio=0.05):
                 w_nhwc = nchw_to_nhwc(w_float, depthwise=is_depthwise)
                 w_int8, w_scale_per_ch = pack_int8_weights_per_channel(w_nhwc)
 
-                # Bias: bn_folded_bias / (s_in * w_scale_per_ch)
-                acc_scale = s_in * w_scale_per_ch
+                # For DW layers: if previous layer had rescale, adjust input scale per channel
+                # rescale amplifies INT8 values, so effective scale per channel decreases
+                if is_depthwise and prev_rescale is not None:
+                    s_in_per_ch = s_in / prev_rescale
+                    acc_scale = s_in_per_ch * w_scale_per_ch
+                else:
+                    acc_scale = s_in * w_scale_per_ch
                 safe_acc_scale = np.where(acc_scale < 1e-10, 1e-10, acc_scale)
                 bias_i32 = np.round(bn_bias_val.cpu().numpy() / safe_acc_scale).astype(np.int32)
 
@@ -697,14 +726,34 @@ def extract_layers(model, threshold_ratio=0.05):
                     "requant_scale": 0.0, "requant_zp": 0,
                 })
 
+            # Per-channel activation rescale: amplify weak channels to fill INT8 range.
+            # Applied after requant+relu. Only useful on PW layers (which feed DW layers).
+            # DW layers don't need rescale because they're per-channel already.
+            rescale = None
+            if not is_depthwise and fr is not None and len(fr) > 2:
+                max_fr = fr.max()
+                # rescale[c] = max_fr / fr[c] — amplify weak channels
+                safe_fr = np.where(fr > max_fr * 0.01, fr, max_fr)  # avoid div by near-zero
+                rescale = (max_fr / safe_fr).astype(np.float32)
+                # Only apply if there's meaningful variance (>20% difference)
+                if rescale.max() / rescale.min() > 1.2:
+                    layers[-1]['rescale_per_ch'] = rescale
+                    print(f"    rescale: [{rescale.min():.2f}, {rescale.max():.2f}] ({(rescale > 1.1).sum()}/{len(rescale)} channels amplified)")
+                else:
+                    layers[-1]['rescale_per_ch'] = None
+            else:
+                layers[-1]['rescale_per_ch'] = None
+
             print(f"  {range_key:30s} s_in={s_in:.6f} s_out={s_out:.6f} requant=[{requant_per_ch.min():.4f}, {requant_per_ch.max():.4f}]")
             s_in = s_out  # update for next layer
+            prev_rescale = layers[-1].get('rescale_per_ch')
 
     # --- Global average pool (scale unchanged) ---
     layers.append({
         "name": "pool",
         "type": "LAYER_GLOBAL_AVG_POOL",
         "quant": "QUANT_INT8",
+        "rescale_per_ch": None,
         "in_c": layers[-1]["out_c"],
         "out_c": layers[-1]["out_c"],
         "kernel": 0, "stride": 0, "padding": 0,
@@ -739,6 +788,7 @@ def extract_layers(model, threshold_ratio=0.05):
         "weight_scale": float(w_scale_per_ch.max()),
         "bias": bias_i32,
         "requant_per_ch": requant_per_ch,
+        "rescale_per_ch": None,
         "in_c": classifier.in_features,
         "out_c": n_cls,
         "kernel": 0, "stride": 0, "padding": 0,
@@ -838,6 +888,17 @@ def generate_header(layers, output_path):
             lines.append(f"    {items}")
             lines.append("};")
 
+        if layer.get("rescale_per_ch") is not None:
+            rs = layer["rescale_per_ch"]
+            total_flash += len(rs) * 4
+            items = ", ".join(f"{float(v):.6f}f" for v in rs)
+            lines.append(
+                f"static const float __attribute__((aligned(16))) "
+                f"layer{i}_rescale_per_ch[{len(rs)}] = {{"
+            )
+            lines.append(f"    {items}")
+            lines.append("};")
+
         lines.append(f"static const float layer{i}_requant_scale = {layer['requant_scale']:.6f}f;")
         lines.append(f"static const int8_t layer{i}_requant_zp = {layer['requant_zp']};")
         lines.append("")
@@ -853,6 +914,7 @@ def generate_header(layers, output_path):
         weights_ref = f"layer{i}_weights" if has_weights else "NULL"
         bias_ref = f"layer{i}_bias" if "bias" in layer else "NULL"
         rq_per_ch_ref = f"layer{i}_requant_per_ch" if "requant_per_ch" in layer else "NULL"
+        rs_per_ch_ref = f"layer{i}_rescale_per_ch" if layer.get("rescale_per_ch") is not None else "NULL"
 
         sp = f"{layer.get('scale_pos', 0):.6f}f"
         sn = f"{layer.get('scale_neg', 0):.6f}f"
@@ -861,7 +923,7 @@ def generate_header(layers, output_path):
             f"    {{ {layer['type']}, {layer['quant']}, "
             f"{weights_ref}, {bias_ref}, "
             f"{sp}, {sn}, "
-            f"layer{i}_requant_scale, {rq_per_ch_ref}, layer{i}_requant_zp, "
+            f"layer{i}_requant_scale, {rq_per_ch_ref}, {rs_per_ch_ref}, layer{i}_requant_zp, "
             f"{layer['in_c']}, {layer['out_c']}, "
             f"{layer['kernel']}, {layer['stride']}, {layer['padding']} }},"
         )

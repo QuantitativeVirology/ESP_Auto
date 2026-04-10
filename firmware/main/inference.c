@@ -131,6 +131,11 @@ int classify_image(const int8_t *input_96x96x3)
                 relu_i8(&out[y * row_elems], row_elems);
             }
 
+            /* Per-channel activation rescale (amplify weak channels) */
+            if (L->rescale_per_ch) {
+                rescale_i8_per_channel(out, w_out, h_out, L->out_c, L->rescale_per_ch);
+            }
+
             cur_h = h_out;
             cur_w = w_out;
             break;
@@ -162,6 +167,11 @@ int classify_image(const int8_t *input_96x96x3)
                         L->requant_scale_per_ch, NULL, L->requant_zp);
                 }
                 relu_i8(&out[y * row_elems], row_elems);
+            }
+
+            /* Per-channel activation rescale (amplify weak channels) */
+            if (L->rescale_per_ch) {
+                rescale_i8_per_channel(out, w_out, h_out, L->out_c, L->rescale_per_ch);
             }
 
             cur_h = h_out;

@@ -125,3 +125,24 @@ void requantize_i32_to_i8_per_channel(
         }
     }
 }
+
+
+void rescale_i8_per_channel(
+    int8_t *data,
+    int width, int height,
+    int channels,
+    const float *scale)
+{
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            for (int c = 0; c < channels; c++) {
+                int idx = (y * width + x) * channels + c;
+                float fval = data[idx] * scale[c];
+                int32_t val = (fval >= 0) ? (int32_t)(fval + 0.5f) : (int32_t)(fval - 0.5f);
+                if (val < -128) val = -128;
+                if (val > 127) val = 127;
+                data[idx] = (int8_t)val;
+            }
+        }
+    }
+}
