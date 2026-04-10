@@ -195,7 +195,10 @@ def _load_calibration_images(data_dir=None):
         for c in range(3):
             norm = uint8_hwc[:,:,c].astype(np.float32) / 255.0
             norm = (norm - MEAN[c]) / STD[c]
-            int8_img[:,:,c] = np.clip(np.round(norm * 127), -128, 127).astype(np.int8)
+            # Symmetric rounding (round-half-away-from-zero) to match firmware
+            scaled = norm * 127
+            rounded = np.where(scaled >= 0, np.floor(scaled + 0.5), np.ceil(scaled - 0.5))
+            int8_img[:,:,c] = np.clip(rounded, -128, 127).astype(np.int8)
         cal_images.append(int8_img)
         cal_labels.append(label)
         if label == 0: cats_seen += 1

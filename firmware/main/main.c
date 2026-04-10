@@ -73,7 +73,7 @@ static void run_benchmark(void)
             for (int c = 0; c < 3; c++) {
                 int idx = p * 3 + c;
                 float val = test_images[i][idx] * norm_scale[c] + norm_offset[c];
-                int32_t ival = (int32_t)(val + 0.5f);
+                int32_t ival = (val >= 0) ? (int32_t)(val + 0.5f) : (int32_t)(val - 0.5f);
                 if (ival < -128) ival = -128;
                 if (ival > 127) ival = 127;
                 input_buf[idx] = (int8_t)ival;
