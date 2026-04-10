@@ -602,14 +602,7 @@ def extract_layers(model, threshold_ratio=0.05):
     requant_per_ch = (acc_scale / s_out).astype(np.float32)
     requant_per_ch = np.clip(requant_per_ch, 1e-6, 10.0)
 
-    # Compute rescale for first_conv (feeds into DW layer)
-    first_rescale = None
-    if fr is not None and len(fr) > 2:
-        max_fr = fr.max()
-        safe_fr = np.where(fr > max_fr * 0.01, fr, max_fr)
-        first_rescale = (max_fr / safe_fr).astype(np.float32)
-        if first_rescale.max() / first_rescale.min() <= 1.2:
-            first_rescale = None
+    first_rescale = None  # rescale disabled for now
 
     layers.append({
         "name": "first_conv",
@@ -730,19 +723,9 @@ def extract_layers(model, threshold_ratio=0.05):
             # Applied after requant+relu. Only useful on PW layers (which feed DW layers).
             # DW layers don't need rescale because they're per-channel already.
             rescale = None
-            if not is_depthwise and fr is not None and len(fr) > 2:
-                max_fr = fr.max()
-                # rescale[c] = max_fr / fr[c] — amplify weak channels
-                safe_fr = np.where(fr > max_fr * 0.01, fr, max_fr)  # avoid div by near-zero
-                rescale = (max_fr / safe_fr).astype(np.float32)
-                # Only apply if there's meaningful variance (>20% difference)
-                if rescale.max() / rescale.min() > 1.2:
-                    layers[-1]['rescale_per_ch'] = rescale
-                    print(f"    rescale: [{rescale.min():.2f}, {rescale.max():.2f}] ({(rescale > 1.1).sum()}/{len(rescale)} channels amplified)")
-                else:
-                    layers[-1]['rescale_per_ch'] = None
-            else:
-                layers[-1]['rescale_per_ch'] = None
+            # Per-channel rescale disabled — needs careful tuning to avoid clipping
+            # The infrastructure is in place (firmware + export) for future use
+            layers[-1]['rescale_per_ch'] = None
 
             print(f"  {range_key:30s} s_in={s_in:.6f} s_out={s_out:.6f} requant=[{requant_per_ch.min():.4f}, {requant_per_ch.max():.4f}]")
             s_in = s_out  # update for next layer
