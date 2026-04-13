@@ -164,8 +164,14 @@ def _im2col(input_hwc, K, stride, padding):
     return patches, H_out, W_out
 
 
-def _load_calibration_images(data_dir=None):
-    """Load balanced calibration images as firmware-style INT8."""
+def _load_calibration_images(data_dir=None, n_per_class=32):
+    """Load balanced calibration images as firmware-style INT8.
+
+    Uses the same dataset iteration order and transforms as
+    export_test_images() in train_baseline.py, so the first n_per_class
+    cats and dogs are identical to the firmware's embedded test images
+    when n_per_class=10.
+    """
     import torchvision.transforms as transforms
     from train_baseline import BinaryPetsDataset
     import os
@@ -188,8 +194,8 @@ def _load_calibration_images(data_dir=None):
     cal_images, cal_labels = [], []
     cats_seen, dogs_seen = 0, 0
     for img, label in ds:
-        if label == 0 and cats_seen >= 32: continue
-        if label == 1 and dogs_seen >= 32: continue
+        if label == 0 and cats_seen >= n_per_class: continue
+        if label == 1 and dogs_seen >= n_per_class: continue
         uint8_hwc = (img * 255).byte().permute(1, 2, 0).contiguous().numpy()
         int8_img = np.zeros((96, 96, 3), dtype=np.int8)
         for c in range(3):
@@ -203,7 +209,7 @@ def _load_calibration_images(data_dir=None):
         cal_labels.append(label)
         if label == 0: cats_seen += 1
         else: dogs_seen += 1
-        if cats_seen >= 32 and dogs_seen >= 32: break
+        if cats_seen >= n_per_class and dogs_seen >= n_per_class: break
 
     return cal_images, cal_labels
 
@@ -290,12 +296,12 @@ def _measure_float_activation_ranges(model, data_dir=None):
 
 
 def _verify_quantized_pipeline(layers, data_dir=None):
-    """Run a few calibration images through the simulated INT8 pipeline.
+    """Run the same test images as firmware through the simulated INT8 pipeline.
 
-    Uses the layers' current requant_per_ch and bias values (does NOT modify them).
-    Prints classifier outputs for verification.
+    Uses n_per_class=10 (20 images total) to match the firmware's embedded
+    test images from test_images.h, ensuring apples-to-apples accuracy comparison.
     """
-    cal_images, cal_labels = _load_calibration_images(data_dir)
+    cal_images, cal_labels = _load_calibration_images(data_dir, n_per_class=10)
     if not cal_images:
         print("[export] WARNING: No calibration data for verification")
         return
@@ -309,8 +315,16 @@ def _verify_quantized_pipeline(layers, data_dir=None):
 
         for li, L in enumerate(layers):
             if L['type'] == 'LAYER_GLOBAL_AVG_POOL':
-                pooled = act.astype(np.int32).mean(axis=(0, 1))
-                act = np.clip(np.round(pooled), -128, 127).astype(np.int8).reshape(1, 1, -1)
+                # Match firmware: (sum + count/2) / count with C truncation toward zero
+                n_ch = act.shape[2]
+                count = cur_h * cur_w
+                half = count // 2
+                pooled = np.zeros(n_ch, dtype=np.int8)
+                for c in range(n_ch):
+                    s = int(act[:, :, c].astype(np.int32).sum())
+                    avg = int((s + half) / count)  # int() truncates toward zero like C
+                    pooled[c] = np.int8(max(-128, min(127, avg)))
+                act = pooled.reshape(1, 1, -1)
                 cur_h, cur_w = 1, 1
                 continue
 
@@ -439,8 +453,16 @@ def _calibrate_requant(layers, n_passes=2, data_dir=None):
 
             for li, L in enumerate(layers):
                 if L['type'] == 'LAYER_GLOBAL_AVG_POOL':
-                    pooled = act.astype(np.int32).mean(axis=(0, 1))
-                    act = np.clip(np.round(pooled), -128, 127).astype(np.int8).reshape(1, 1, -1)
+                    # Match firmware: (sum + count/2) / count with C truncation
+                    n_ch = act.shape[2]
+                    count = cur_h * cur_w
+                    half = count // 2
+                    pooled = np.zeros(n_ch, dtype=np.int8)
+                    for c in range(n_ch):
+                        s = int(act[:, :, c].astype(np.int32).sum())
+                        avg = int((s + half) / count)
+                        pooled[c] = np.int8(max(-128, min(127, avg)))
+                    act = pooled.reshape(1, 1, -1)
                     cur_h, cur_w = 1, 1
                     continue
 
@@ -974,10 +996,24 @@ def main():
     parser.add_argument("--output", default="firmware/main/model_data.h")
     parser.add_argument("--alpha", type=float, default=0.25)
     parser.add_argument("--threshold-ratio", type=float, default=0.05)
+    parser.add_argument("--quant-config", choices=["default", "autoresearch"],
+                        default="default",
+                        help="'autoresearch' loads config from autoresearch/train.py")
     args = parser.parse_args()
 
     model = MobileNetV1(alpha=args.alpha, num_classes=2)
-    config = get_default_quant_config(model)
+
+    if args.quant_config == "autoresearch":
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "train_target", Path(__file__).parent.parent / "autoresearch" / "train.py")
+        train_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(train_mod)
+        config = train_mod.get_quant_config()
+        print(f"Using quant config from autoresearch/train.py")
+    else:
+        config = get_default_quant_config(model)
+
     apply_ttq(model, config, args.threshold_ratio)
 
     if Path(args.weights).exists():
